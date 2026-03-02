@@ -736,9 +736,71 @@
       background: var(--blue-muted);
     }
 
+    /* Hamburger button — mobile only */
+    .burger {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 0.5rem;
+      align-items: center;
+      justify-content: center;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .burger:hover { color: var(--text); }
+
+    /* Mobile menu overlay */
+    .mobile-menu {
+      display: none;
+      position: fixed;
+      top: 60px;
+      left: 0;
+      right: 0;
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border);
+      padding: 1rem 1.5rem;
+      z-index: 99;
+      flex-direction: column;
+      gap: 0.25rem;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    }
+
+    .mobile-menu.open {
+      display: flex;
+    }
+
+    .mobile-menu a,
+    .mobile-menu button {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.75rem 0.5rem;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      font-family: var(--mono);
+      border-radius: 4px;
+      transition: background 0.15s, color 0.15s;
+      background: none;
+      border: none;
+      cursor: pointer;
+      width: 100%;
+      text-align: left;
+    }
+
+    .mobile-menu a:hover,
+    .mobile-menu button:hover {
+      color: var(--text);
+      background: var(--bg-card-hover);
+    }
+
     @media (max-width: 640px) {
-      .nav-links a:not(.nav-cta) {
+      .nav-links {
         display: none;
+      }
+      .burger {
+        display: flex;
       }
     }
 
@@ -880,8 +942,27 @@
         </button>
         <a href="https://github.com/machina-sports/sportsclaw" target="_blank" rel="noopener" class="nav-cta"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>Star on GitHub</a>
       </div>
+      <!-- Hamburger button (mobile only) -->
+      <button class="burger" id="burger-btn" aria-label="Open menu" aria-expanded="false">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+      </button>
     </div>
   </header>
+
+  <!-- Mobile menu dropdown -->
+  <nav class="mobile-menu" id="mobile-menu">
+    <a href="https://sports-skills.sh" target="_blank">sports-skills.sh</a>
+    <a href="#pricing">Pricing</a>
+    <a href="https://github.com/machina-sports/sportsclaw" target="_blank" rel="noopener">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
+      Star on GitHub
+    </a>
+    <button id="mobile-theme-toggle" aria-label="Toggle theme">
+      <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+      <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+      Toggle theme
+    </button>
+  </nav>
 
   <main>
     <!-- Hero -->
@@ -1103,6 +1184,35 @@
 
     const themeToggle = document.getElementById('theme-toggle');
     themeToggle.addEventListener('click', toggleTheme);
+
+    // Mobile theme toggle (inside burger menu)
+    const mobileThemeToggle = document.getElementById('mobile-theme-toggle');
+    mobileThemeToggle.addEventListener('click', toggleTheme);
+
+    // Hamburger menu
+    const burgerBtn = document.getElementById('burger-btn');
+    const mobileMenu = document.getElementById('mobile-menu');
+
+    function closeMobileMenu() {
+      mobileMenu.classList.remove('open');
+      burgerBtn.setAttribute('aria-expanded', 'false');
+    }
+
+    burgerBtn.addEventListener('click', () => {
+      const isOpen = mobileMenu.classList.toggle('open');
+      burgerBtn.setAttribute('aria-expanded', isOpen);
+    });
+
+    // Close mobile menu when clicking outside or on a link
+    document.addEventListener('click', (e) => {
+      if (!mobileMenu.contains(e.target) && !burgerBtn.contains(e.target)) {
+        closeMobileMenu();
+      }
+    });
+
+    mobileMenu.querySelectorAll('a').forEach(link => {
+      link.addEventListener('click', closeMobileMenu);
+    });
 
     // Copy install script from pricing card
     const copyInstallCta = document.getElementById('copy-install-cta');
