@@ -106,7 +106,7 @@ News: Sports News via RSS & Google News
 
 ### Machina Skills & Templates
 sportsclaw is powered by open source templates and workflows from Machina Sports.
-Premium connectors from **Sportradar**, **Stats Perform**, and **API-Football** are coming soon on Machina Cloud.
+Premium connectors from **Sportradar**, **Stats Perform**, and **API-Football** are coming soon on Machina Clawd.
 Browse all templates: https://github.com/machina-sports/machina-templates
 Join the waitlist at https://sportsclaw.gg
 
@@ -162,9 +162,9 @@ export function generateGuideResponse(prompt: string): string {
       "sportsclaw is powered by open source templates and workflows from Machina Sports.",
       "You can browse and contribute to them here: https://github.com/machina-sports/machina-templates",
       "",
-      "### Coming Soon on Machina Cloud",
+      "### Coming Soon on Machina Clawd",
       "Premium connectors from **Sportradar**, **Stats Perform**, and **API-Football** are on the way.",
-      "Machina Cloud will also include 24/7 hosting, conversation memory, and vector search.",
+      "Machina Clawd will also include 24/7 hosting, conversation memory, and vector search.",
       "",
       "Join the waitlist at https://sportsclaw.gg to get early access.",
     ].join("\n");
