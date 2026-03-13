@@ -64,8 +64,8 @@ The developer experience must be conversational and intuitive. Instead of forcin
    - *Dev:* "Give me Memphis Depay's best moments"
    - *CLI action:* Passes this query to the LLM to filter the PBP data for high-leverage events matching the intent.
 
-## 10. Gemini 1.5 Pro "Twelve Labs" Parity
-To rival specialized multimodal engines like Twelve Labs, we cannot just use frame-by-frame image sampling. We must leverage Gemini 1.5 Pro's native Video + Audio understanding capabilities.
+## 10. Gemini 1.5 Pro Multimodal Parity
+To achieve state-of-the-art multimodal extraction, we cannot just use frame-by-frame image sampling. We must leverage Gemini 1.5 Pro's native Video + Audio understanding capabilities.
 - **Native Video Ingestion:** Instead of manually extracting frames with FFmpeg for OCR/Syncing, we upload the raw video chunks natively to the Gemini File API (which supports up to 1-hour video contexts).
 - **Audio-Visual "Hype" Scoring:** Legacy clipping is visually blind. To find a player's "best moments", the prompt to Gemini must combine the PBP event timestamp with a multi-modal instruction: *"Analyze this video segment. Focus on player #10 (Depay). Cross-reference his physical actions (dribbles, shots) with spikes in the audio track (crowd noise/announcer excitement) to assign a 'Hype Score' from 1-10. Only clip moments scoring 7+."*
 - This approach bridges the gap between structured data (PBP) and unstructured multi-modal reality (video action + audio crowd context), achieving Twelve Labs-level semantic extraction without needing a dedicated video foundational model.
