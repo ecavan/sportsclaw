@@ -49,3 +49,23 @@ Instead, the CLI utilizes **Gemini Vision OCR**:
 3. Gemini returns the exact video timestamp of kickoff/tip-off.
 4. The engine automatically maps this anchor point to the Play-by-Play (PBP) data API timestamps. 
 Result: The user simply runs `sportsclaw clip ./match.mp4 --match-id epl_9876 --query "All goals"`, and the engine handles the temporal alignment autonomously.
+
+## 9. Conversational CLI Wizard (The "Magic" DX)
+The developer experience must be conversational and intuitive. Instead of forcing developers to pass exact flags (e.g., `--match-id epl_9876 --file ./match.mp4`), the CLI must guide them via a natural language flow:
+1. **Match Selection:** 
+   - *CLI:* "What match are you clipping?"
+   - *Dev:* "Corinthians vs Flamengo last week"
+   - *CLI action:* Hits the Machina API, performs a semantic search, and presents a selectable list of the top 3 matches.
+2. **File Selection:** 
+   - *CLI:* "Where is the video file?"
+   - *Dev:* Provides the local path (with tab-autocomplete support).
+3. **Highlight Intent:** 
+   - *CLI:* "What do you want to highlight?"
+   - *Dev:* "Give me Memphis Depay's best moments"
+   - *CLI action:* Passes this query to the LLM to filter the PBP data for high-leverage events matching the intent.
+
+## 10. Gemini 1.5 Pro "Twelve Labs" Parity
+To rival specialized multimodal engines like Twelve Labs, we cannot just use frame-by-frame image sampling. We must leverage Gemini 1.5 Pro's native Video + Audio understanding capabilities.
+- **Native Video Ingestion:** Instead of manually extracting frames with FFmpeg for OCR/Syncing, we upload the raw video chunks natively to the Gemini File API (which supports up to 1-hour video contexts).
+- **Audio-Visual "Hype" Scoring:** Legacy clipping is visually blind. To find a player's "best moments", the prompt to Gemini must combine the PBP event timestamp with a multi-modal instruction: *"Analyze this video segment. Focus on player #10 (Depay). Cross-reference his physical actions (dribbles, shots) with spikes in the audio track (crowd noise/announcer excitement) to assign a 'Hype Score' from 1-10. Only clip moments scoring 7+."*
+- This approach bridges the gap between structured data (PBP) and unstructured multi-modal reality (video action + audio crowd context), achieving Twelve Labs-level semantic extraction without needing a dedicated video foundational model.
