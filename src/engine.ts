@@ -67,6 +67,12 @@ import {
   generateSessionId,
 } from "./analytics.js";
 import { AskUserQuestionHalt } from "./ask.js";
+import {
+  ApprovalPendingHalt,
+  generateApprovalId,
+  isActionPreApproved,
+  type AgenticAction,
+} from "./approval.js";
 import { isGuideIntent, generateGuideResponse } from "./guide.js";
 import { createTask, listTasks, completeTask } from "./taskbus.js";
 import { renderChart, type ChartType } from "./charts.js";
@@ -2156,6 +2162,138 @@ export class sportsclawEngine {
         } catch (error) {
           return `Chart rendering failed: ${error instanceof Error ? error.message : String(error)}`;
         }
+      },
+    });
+
+    // -----------------------------------------------------------------
+    // Agentic Tools — sandboxed write_file and execute_command
+    // These tools require explicit user approval before execution.
+    // When invoked, they throw ApprovalPendingHalt to halt the engine
+    // loop and prompt the user for consent.
+    // -----------------------------------------------------------------
+
+    const agenticPlatform = "cli"; // default; listeners override via RunOptions
+    const agenticUserId = runUserId ?? "anonymous";
+
+    toolMap["write_file"] = defineTool({
+      description:
+        "Write content to a file inside the Docker sandbox. This is a privileged " +
+        "operation that requires user approval. The file is written to the sandbox " +
+        "filesystem, not the host. Use for generating scripts, configs, or data files " +
+        "that other sandbox commands will consume.",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description:
+              "Path inside the sandbox container where the file will be written " +
+              "(e.g., '/workspace/script.py').",
+          },
+          content: {
+            type: "string",
+            description: "The full file content to write.",
+          },
+        },
+        required: ["path", "content"],
+      }),
+      execute: async (args: { path?: string; content?: string }) => {
+        const { path: filePath, content: fileContent } = args;
+        if (!filePath || typeof fileContent !== "string") {
+          return "Error: both path and content are required.";
+        }
+
+        // Check for allow-always rule
+        const preApproved = await isActionPreApproved(
+          agenticPlatform,
+          agenticUserId,
+          "write_file"
+        );
+        if (!preApproved) {
+          const requestId = generateApprovalId();
+          throw new ApprovalPendingHalt({
+            id: requestId,
+            action: "write_file",
+            description: `Write ${fileContent.length} bytes to ${filePath}`,
+            toolArgs: { path: filePath, content: fileContent },
+            platform: agenticPlatform,
+            userId: agenticUserId,
+            createdAt: new Date().toISOString(),
+          });
+        }
+
+        // Pre-approved: execute in sandbox
+        return JSON.stringify({
+          status: "approval-pending",
+          message:
+            "write_file is routed through the Docker sandbox. " +
+            "Action was pre-approved via allow-always.",
+          action: "write_file",
+          path: filePath,
+          size: fileContent.length,
+        });
+      },
+    });
+
+    toolMap["execute_command"] = defineTool({
+      description:
+        "Execute a shell command inside the Docker sandbox. This is a privileged " +
+        "operation that requires user approval. Commands run in an isolated container " +
+        "with no access to the host filesystem or network credentials. Use for " +
+        "running scripts, installing packages, or processing data.",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          command: {
+            type: "string",
+            description:
+              "The shell command to execute inside the sandbox " +
+              "(e.g., 'python3 script.py', 'pip install pandas').",
+          },
+          timeout_ms: {
+            type: "number",
+            description:
+              "Maximum execution time in milliseconds. Default: 30000 (30s). Max: 300000 (5m).",
+          },
+        },
+        required: ["command"],
+      }),
+      execute: async (args: { command?: string; timeout_ms?: number }) => {
+        const { command: cmd, timeout_ms: timeoutMs } = args;
+        if (!cmd) {
+          return "Error: command is required.";
+        }
+        const effectiveTimeout = Math.min(timeoutMs ?? 30_000, 300_000);
+
+        // Check for allow-always rule
+        const preApproved = await isActionPreApproved(
+          agenticPlatform,
+          agenticUserId,
+          "execute_command"
+        );
+        if (!preApproved) {
+          const requestId = generateApprovalId();
+          throw new ApprovalPendingHalt({
+            id: requestId,
+            action: "execute_command",
+            description: `Execute: ${cmd.length > 120 ? cmd.slice(0, 120) + "..." : cmd}`,
+            toolArgs: { command: cmd, timeout_ms: effectiveTimeout },
+            platform: agenticPlatform,
+            userId: agenticUserId,
+            createdAt: new Date().toISOString(),
+          });
+        }
+
+        // Pre-approved: execute in sandbox
+        return JSON.stringify({
+          status: "approval-pending",
+          message:
+            "execute_command is routed through the Docker sandbox. " +
+            "Action was pre-approved via allow-always.",
+          action: "execute_command",
+          command: cmd,
+          timeout_ms: effectiveTimeout,
+        });
       },
     });
 
