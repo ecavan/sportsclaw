@@ -1650,7 +1650,7 @@ function printHelp(): void {
 // ---------------------------------------------------------------------------
 
 async function cmdConfig(opts?: { fromChat?: boolean }): Promise<void> {
-  await runConfigFlow(opts);
+  await runConfigFlow();
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,7 +1658,7 @@ async function cmdConfig(opts?: { fromChat?: boolean }): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function cmdChannels(opts?: { fromChat?: boolean }): Promise<void> {
-  await runChannelsFlow(opts);
+  await runChannelsFlow();
 }
 
 // ---------------------------------------------------------------------------
@@ -1694,7 +1694,7 @@ function cmdAgents(opts?: { fromChat?: boolean }): void {
 
 async function cmdSetup(args: string[], opts?: { fromChat?: boolean }): Promise<void> {
   const prompt = args.filter((a) => !a.startsWith("-")).join(" ").trim() || undefined;
-  await runSetup(prompt, opts);
+  await runSetup(prompt);
 }
 
 // ---------------------------------------------------------------------------

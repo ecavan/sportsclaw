@@ -115,7 +115,7 @@ const MATCH_SPORTS = [
  * Query local sports-skills for recent/live matches across multiple sports.
  * Parses the bridge result and returns a flat array of selectable options.
  */
-async function fetchRecentMatches(
+export async function fetchRecentMatches(
   query?: string,
   pythonPath?: string,
 ): Promise<MatchOption[]> {
@@ -148,13 +148,40 @@ async function fetchRecentMatches(
     }
   }
 
-  // Filter by query if provided
+  // Filter by query using Gemini LLM (Smart Match)
   if (query && query.trim().length > 0) {
-    const q = query.toLowerCase();
-    const filtered = options.filter(
-      (o) => o.label.toLowerCase().includes(q) || (o.hint ?? "").toLowerCase().includes(q)
-    );
-    if (filtered.length > 0) return filtered;
+    try {
+      const apiKey = await resolveCredential("gemini");
+      if (apiKey) {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const prompt = `
+You are a sports match resolver. 
+The user searched for: "${query}"
+
+Here is the JSON list of currently active or recent matches:
+${JSON.stringify(options, null, 2)}
+
+Identify the exact match the user means. Return ONLY the "value" string of that match (e.g., "nba_0022500962").
+If absolutely no match makes sense for the query, return exactly "NOT_FOUND".`;
+
+        const result = await model.generateContent(prompt);
+        const text = result.response.text().trim().replace(/['"`]/g, '');
+        if (text === "NOT_FOUND") return [];
+        const found = options.find(o => o.value === text);
+        if (found) return [found];
+      }
+    } catch (e) {
+      // Fallback below
+    }
+
+    // Fallback to strict string match if LLM fails or misses
+    const qTokens = query.toLowerCase().split(/\s+/).filter(t => t !== "vs" && t !== "at" && t.length > 1);
+    const filtered = options.filter((o) => {
+      const text = `${o.label.toLowerCase()} ${(o.hint ?? "").toLowerCase()}`;
+      return qTokens.every(t => text.includes(t));
+    });
+    return filtered;
   }
 
   return options;
@@ -166,31 +193,40 @@ async function fetchRecentMatches(
  * as well as flat arrays and nested data wrappers.
  */
 function extractEvents(data: Record<string, unknown>): Array<{ id: string; name: string }> {
-  // Direct events array
-  if (Array.isArray(data.events)) {
-    return (data.events as Array<Record<string, unknown>>)
-      .filter((e) => typeof e.id === "string" && typeof e.name === "string")
-      .map((e) => ({ id: e.id as string, name: e.name as string }));
-  }
+  const extracted: Array<{ id: string; name: string }> = [];
+  let eventsArray: any[] = [];
 
-  // Nested under data.events (sports-skills wrapper)
-  if (data.data && typeof data.data === "object") {
+  if (Array.isArray(data.events)) {
+    eventsArray = data.events;
+  } else if (data.data && typeof data.data === "object") {
     const inner = data.data as Record<string, unknown>;
     if (Array.isArray(inner.events)) {
-      return (inner.events as Array<Record<string, unknown>>)
-        .filter((e) => typeof e.id === "string" && typeof e.name === "string")
-        .map((e) => ({ id: e.id as string, name: e.name as string }));
+      eventsArray = inner.events;
+    } else if (Array.isArray(inner.games)) {
+      eventsArray = inner.games;
+    }
+  } else if (Array.isArray(data)) {
+    eventsArray = data;
+  }
+
+  for (const e of eventsArray) {
+    if (!e || typeof e !== "object") continue;
+    const id = e.id || e.idEvent || e.gameId;
+    if (!id) continue;
+
+    let name = e.name || e.strEvent;
+    if (!name && Array.isArray(e.competitors) && e.competitors.length >= 2) {
+      const c1 = e.competitors[0]?.team?.name || "Unknown";
+      const c2 = e.competitors[1]?.team?.name || "Unknown";
+      // ESPN format: competitors[0] is home, [1] is away
+      name = `${c2} at ${c1}`;
+    }
+
+    if (id && name) {
+      extracted.push({ id: String(id), name: String(name) });
     }
   }
-
-  // Flat array at top level
-  if (Array.isArray(data)) {
-    return (data as Array<Record<string, unknown>>)
-      .filter((e) => typeof e.id === "string" && typeof e.name === "string")
-      .map((e) => ({ id: e.id as string, name: e.name as string }));
-  }
-
-  return [];
+  return extracted;
 }
 
 // ---------------------------------------------------------------------------
@@ -331,13 +367,10 @@ function validateVideoPath(filePath: string): string | undefined {
 // Main CLI flow
 // ---------------------------------------------------------------------------
 
-export async function cmdClip(args: string[] = [], opts?: { fromChat?: boolean }): Promise<void> {
+export async function cmdClip(args: string[] = []): Promise<void> {
   const flags = parseClipArgs(args);
 
-  p.intro(pc.bold("SportsClaw Auto-Clipper") + pc.dim(" (Vision + PBP Engine)"));
-
-  // Show credential status
-  printCredentialStatus();
+  p.intro(pc.bold("sportsclaw auto-clipper"));
 
   // Step 1: Ensure Gemini auth (required for Vision OCR + Hype Scoring)
   await ensureCredential("gemini", {

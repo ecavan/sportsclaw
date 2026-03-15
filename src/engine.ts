@@ -2166,7 +2166,7 @@ export class sportsclawEngine {
     });
 
     // -----------------------------------------------------------------
-    // Agentic Tools — sandboxed write_file and execute_command
+    // Agentic Tools — write_file and execute_command
     // These tools require explicit user approval before execution.
     // When invoked, they throw ApprovalPendingHalt to halt the engine
     // loop and prompt the user for consent.
@@ -2177,18 +2177,16 @@ export class sportsclawEngine {
 
     toolMap["write_file"] = defineTool({
       description:
-        "Write content to a file inside the Docker sandbox. This is a privileged " +
-        "operation that requires user approval. The file is written to the sandbox " +
-        "filesystem, not the host. Use for generating scripts, configs, or data files " +
-        "that other sandbox commands will consume.",
+        "Write content to a file. This is a privileged " +
+        "operation that requires user approval. Content is written to the local filesystem.",
       inputSchema: jsonSchema({
         type: "object",
         properties: {
           path: {
             type: "string",
             description:
-              "Path inside the sandbox container where the file will be written " +
-              "(e.g., '/workspace/script.py').",
+              "Path where the file will be written " +
+              "(e.g., './output/script.py').",
           },
           content: {
             type: "string",
@@ -2222,12 +2220,11 @@ export class sportsclawEngine {
           });
         }
 
-        // Pre-approved: execute in sandbox
+        // Pre-approved: execute
         return JSON.stringify({
           status: "approval-pending",
           message:
-            "write_file is routed through the Docker sandbox. " +
-            "Action was pre-approved via allow-always.",
+            "write_file action was pre-approved via allow-always.",
           action: "write_file",
           path: filePath,
           size: fileContent.length,
@@ -2237,9 +2234,8 @@ export class sportsclawEngine {
 
     toolMap["execute_command"] = defineTool({
       description:
-        "Execute a shell command inside the Docker sandbox. This is a privileged " +
-        "operation that requires user approval. Commands run in an isolated container " +
-        "with no access to the host filesystem or network credentials. Use for " +
+        "Execute a shell command. This is a privileged " +
+        "operation that requires user approval. Use for " +
         "running scripts, installing packages, or processing data.",
       inputSchema: jsonSchema({
         type: "object",
@@ -2247,7 +2243,7 @@ export class sportsclawEngine {
           command: {
             type: "string",
             description:
-              "The shell command to execute inside the sandbox " +
+              "The shell command to execute " +
               "(e.g., 'python3 script.py', 'pip install pandas').",
           },
           timeout_ms: {
@@ -2284,12 +2280,11 @@ export class sportsclawEngine {
           });
         }
 
-        // Pre-approved: execute in sandbox
+        // Pre-approved: execute
         return JSON.stringify({
           status: "approval-pending",
           message:
-            "execute_command is routed through the Docker sandbox. " +
-            "Action was pre-approved via allow-always.",
+            "execute_command action was pre-approved via allow-always.",
           action: "execute_command",
           command: cmd,
           timeout_ms: effectiveTimeout,
