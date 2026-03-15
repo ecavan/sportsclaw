@@ -1082,11 +1082,17 @@ function promptWithSlashIntercept(
         process.stdout.write(`\x1B[${savedLines}A\x1B[J`);
       }
 
-      // Calculate lines needed
+      // Calculate lines needed - account for buffer wrapping
+      const promptLen = promptText.replace(/\x1B\[[0-9;]*m/g, "").length;
+      const bufLen = buffer.replace(/\x1B\[[0-9;]*m/g, "").length;
+      const cols = process.stdout.columns || 80;
+      const promptLineLen = promptLen + bufLen;
+      const wrappedLines = Math.max(1, Math.ceil(promptLineLen / cols));
+      
       let lines = 0;
       
-      // Prompt line
-      lines++;
+      // Prompt line(s) - account for wrapping
+      lines += wrappedLines;
       
       // Command suggestions (if showing)
       if (showCommands && filtered.length > 0) {
@@ -1131,16 +1137,24 @@ function promptWithSlashIntercept(
           process.stdout.write(buffer);
         }
       }
-
-      // Position cursor
-      const promptLen = promptText.replace(/\\x1B\[[0-9;]*m/g, "").length;
-      const bufLen = buffer.replace(/\\x1B\[[0-9;]*m/g, "").length;
-      const totalChars = promptLen + bufLen;
-      const cursorLine = Math.floor((promptLen + cursorPos) / process.stdout.columns);
-      const cursorCol = (promptLen + cursorPos) % process.stdout.columns;
       
-      // Move cursor to position
-      process.stdout.write(`\r\x1B[${cursorLine}B\x1B[${cursorCol}D`);
+      // Clear to end of line to remove any leftover characters
+      process.stdout.write("\x1B[K");
+
+      // Calculate cursor position for placement after buffer
+      const totalLen = promptLen + bufLen;
+      const cursorLine = Math.floor(totalLen / cols);
+      const cursorCol = totalLen % cols;
+
+      // Move cursor to correct position (accounting for wrapping)
+      if (cursorLine > 0) {
+        // Move up cursorLine lines, then to correct column
+        process.stdout.write(`\r\x1B[${cursorLine}A`);
+        process.stdout.write(`\x1B[${cursorCol + 1}G`); // +1 because columns are 1-indexed
+      } else {
+        // Just move to the correct column
+        process.stdout.write(`\x1B[${cursorCol + 1}G`);
+      }
     }
 
     // Key handler
@@ -1252,6 +1266,7 @@ function promptWithSlashIntercept(
     // Cleanup function to restore terminal
     function cleanup() {
       process.stdin.removeListener("data", onKey);
+      process.stdout.removeListener("resize", onResize);
       process.stdout.write("\x1B[?1049l"); // Restore normal screen buffer
       process.stdout.write("\x1B[?25h");   // Show cursor
       if (!originalRaw) {
@@ -1261,6 +1276,12 @@ function promptWithSlashIntercept(
 
     // Set up input listener
     process.stdin.on("data", onKey);
+
+    // Handle window resize - re-render to fix line calculations
+    const onResize = () => {
+      render();
+    };
+    process.stdout.on("resize", onResize);
 
     // Initial render
     render();
