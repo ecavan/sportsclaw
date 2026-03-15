@@ -1013,6 +1013,15 @@ function promptWithSlashIntercept(
   history: string[],
 ): Promise<PromptResult> {
   return new Promise((resolve) => {
+    const commands = [
+      "/clip", "/skills", "/channels", "/stats", "/compact", "/reset", "/help"
+    ];
+
+    const completer = (line: string): [string[], string] => {
+      const hits = commands.filter(c => c.startsWith(line.toLowerCase()));
+      return [hits.length ? hits : commands, line];
+    };
+
     const rl = createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -1020,60 +1029,24 @@ function promptWithSlashIntercept(
       historySize: 200,
       removeHistoryDuplicates: false,
       terminal: true,
+      completer,
     });
 
-    // Command hints to show when user types /
-    const commands = [
-      { cmd: "/clip", hint: "Launch auto-clipper" },
-      { cmd: "/skills", hint: "List sports-skills" },
-      { cmd: "/channels", hint: "Configure integrations" },
-      { cmd: "/stats", hint: "View usage stats" },
-      { cmd: "/compact", hint: "Summarize messages" },
-      { cmd: "/reset", hint: "Clear history" },
-      { cmd: "/help", hint: "Show help" },
-    ];
-
-    let settled = false;
-    let slashShown = false;
-
-    const showCommandHints = () => {
-      if (slashShown) return;
-      slashShown = true;
-      console.log(pc.dim("\n  Commands: ") + commands.map(c => pc.cyan(c.cmd) + pc.dim(` (${c.hint})`)).join(pc.dim(" | ")));
-      console.log(pc.dim("  Or type any command directly. Press Tab to autocomplete.\n"));
-    };
-
-    const onKeypress = (ch: string | undefined, key: { name?: string }) => {
-      if (settled) return;
-      const line = (rl as unknown as { line: string }).line;
-      
-      // Show hints on /, but don't block - let user keep typing
-      if (ch === "/" && line === "/") {
-        showCommandHints();
-        // Don't intercept - let them keep typing!
+    // Show hint when user types just /
+    rl.on('line', (line) => {
+      if (line === '/') {
+        console.log(pc.dim("\n  Commands: ") + commands.map(c => pc.cyan(c)).join(pc.dim(", ")));
+        console.log(pc.dim("  Tab to autocomplete, or type command and press Enter.\n"));
       }
-      
-      // Tab autocomplete (if we implement later)
-      if (key?.name === "tab") {
-        // Future: implement tab autocomplete
-      }
-    };
-
-    process.stdin.on("keypress", onKeypress);
+    });
 
     rl.question(promptText)
       .then((value) => {
-        if (settled) return;
-        settled = true;
-        process.stdin.removeListener("keypress", onKeypress);
         const snap = [...(rl as unknown as { history: string[] }).history];
         rl.close();
         resolve({ type: "input", value, history: snap });
       })
       .catch(() => {
-        if (settled) return;
-        settled = true;
-        process.stdin.removeListener("keypress", onKeypress);
         rl.close();
         resolve(null);
       });
