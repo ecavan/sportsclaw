@@ -181,6 +181,14 @@ export {
   expireOldTasks,
 } from "./taskbus.js";
 
+// Bracket Builder
+export {
+  createBracket, loadBracket, listBrackets, deleteBracket,
+  makePick, getBracketProgress, getNextMatchups,
+  REGIONS, ROUND_NAMES,
+} from "./bracket.js";
+export type { BracketTeam, BracketMatchup, BracketSession } from "./bracket.js";
+
 // Sprint 3: Subagent spawning
 export {
   subagentManager,
@@ -1014,22 +1022,16 @@ const SLASH_COMMANDS = [
 ];
 
 /**
- * Custom readline implementation that shows inline command hints
- * when user types "/" (like fig or fish shell).
- * 
- * Features:
- * - Immediate command list display when "/" is typed
- * - Real-time filtering as user types (e.g., "/c" shows /channels, /clip)
- * - Full manual typing still works
- * - Enter executes whatever is in the prompt
+ * Simple readline-based prompt with slash-command tab completion
+ * and a one-line hint when "/" is typed.
  */
 function promptWithSlashIntercept(
   promptText: string,
   history: string[],
 ): Promise<PromptResult> {
   return new Promise((resolve) => {
+    // Non-TTY fallback (piped input)
     if (!process.stdin.isTTY) {
-      // Fallback to standard readline when not a TTY
       const rl = createInterface({
         input: process.stdin,
         output: process.stdout,
@@ -1045,246 +1047,57 @@ function promptWithSlashIntercept(
       return;
     }
 
-    // Save original terminal settings
-    const originalRaw = process.stdin.isRaw;
-    const originalEcho = process.stdout.isTTY;
-    
-    // Set raw mode to capture each keystroke
-    process.stdin.setRawMode(true);
-    process.stdout.write("\x1B[?1049h"); // Use alternate screen buffer
-    process.stdout.write("\x1B[?25l");    // Hide cursor
-
-    let buffer = "";
-    let cursorPos = 0;
-    let showCommands = false;
-    let selectedIndex = 0;
-    const historyIndex = history.length;
-    let savedLines = 0;
-
-    // Filter commands based on current input after "/"
-    function getFilteredCommands(): typeof SLASH_COMMANDS {
-      const search = buffer.toLowerCase();
-      if (!search.startsWith("/")) return [];
-      const query = search.slice(1);
-      if (!query) return SLASH_COMMANDS;
-      return SLASH_COMMANDS.filter(c => 
-        c.cmd.toLowerCase().includes(query) || 
-        c.desc.toLowerCase().includes(query)
-      );
-    }
-
-    // Render the current state
-    function render() {
-      const filtered = showCommands ? getFilteredCommands() : [];
-      
-      // Clear previous output (commands + prompt line)
-      if (savedLines > 0) {
-        process.stdout.write(`\x1B[${savedLines}A\x1B[J`);
-      }
-
-      // Calculate lines needed - account for buffer wrapping
-      const promptLen = promptText.replace(/\x1B\[[0-9;]*m/g, "").length;
-      const bufLen = buffer.replace(/\x1B\[[0-9;]*m/g, "").length;
-      const cols = process.stdout.columns || 80;
-      const promptLineLen = promptLen + bufLen;
-      const wrappedLines = Math.max(1, Math.ceil(promptLineLen / cols));
-      
-      let lines = 0;
-      
-      // Prompt line(s) - account for wrapping
-      lines += wrappedLines;
-      
-      // Command suggestions (if showing)
-      if (showCommands && filtered.length > 0) {
-        lines += filtered.length + 1; // +1 for separator line
-      } else if (showCommands && filtered.length === 0) {
-        lines += 2; // "No matches" + separator
-      }
-
-      savedLines = lines;
-
-      // Draw command suggestions
-      if (showCommands) {
-        if (filtered.length > 0) {
-          for (let i = 0; i < filtered.length; i++) {
-            const c = filtered[i];
-            const prefix = i === selectedIndex ? pc.cyan("▶ ") : "  ";
-            const cmd = i === selectedIndex ? pc.cyan(c.cmd) : pc.dim(c.cmd);
-            const desc = pc.dim(c.desc);
-            process.stdout.write(`${prefix}${cmd.padEnd(14)} ${desc}\n`);
-          }
-        } else {
-          process.stdout.write(pc.dim("  No matching commands\n"));
-        }
-        process.stdout.write(pc.dim("\n─── Press Enter to execute, Esc to close ───\n"));
-      }
-
-      // Draw prompt with current input
-      process.stdout.write(promptText);
-      
-      if (buffer.length === 0) {
-        process.stdout.write(pc.dim("_"));
-      } else {
-        // Write buffer, highlighting the "/" in cyan
-        const idx = buffer.indexOf("/");
-        if (idx >= 0) {
-          process.stdout.write(pc.dim(buffer.slice(0, idx)));
-          process.stdout.write(pc.cyan(buffer.slice(idx)));
-          if (idx < buffer.length - 1) {
-            process.stdout.write(pc.dim(buffer.slice(idx + 1)));
-          }
-        } else {
-          process.stdout.write(buffer);
-        }
-      }
-      
-      // Clear to end of line to remove any leftover characters
-      process.stdout.write("\x1B[K");
-
-      // Calculate cursor position for placement after buffer
-      const totalLen = promptLen + bufLen;
-      const cursorLine = Math.floor(totalLen / cols);
-      const cursorCol = totalLen % cols;
-
-      // Move cursor to correct position (accounting for wrapping)
-      if (cursorLine > 0) {
-        // Move up cursorLine lines, then to correct column
-        process.stdout.write(`\r\x1B[${cursorLine}A`);
-        process.stdout.write(`\x1B[${cursorCol + 1}G`); // +1 because columns are 1-indexed
-      } else {
-        // Just move to the correct column
-        process.stdout.write(`\x1B[${cursorCol + 1}G`);
-      }
-    }
-
-    // Key handler
-    const onKey = (chunk: Buffer) => {
-      const key = chunk.toString();
-      const code = chunk[0];
-      const ctrl = chunk[0] === 3; // Ctrl+C
-
-      // Ctrl+C = cancel
-      if (ctrl) {
-        cleanup();
-        process.stdout.write("\n");
-        resolve(null);
-        return;
-      }
-
-      // Escape = close command list, keep typing
-      if (code === 27) {
-        showCommands = false;
-        render();
-        return;
-      }
-
-      // Enter = execute
-      if (key === "\r" || key === "\n") {
-        cleanup();
-        const value = buffer;
-        // Add to history if non-empty
-        if (value.trim()) {
-          history.push(value);
-        }
-        process.stdout.write("\n");
-        resolve({ type: "input", value, history });
-        return;
-      }
-
-      // Backspace
-      if (key === "\x7f" || (code === 127)) {
-        if (cursorPos > 0) {
-          buffer = buffer.slice(0, cursorPos - 1) + buffer.slice(cursorPos);
-          cursorPos--;
-        }
-        // Update command list visibility
-        showCommands = buffer.startsWith("/");
-        if (showCommands) {
-          selectedIndex = 0;
-        }
-        render();
-        return;
-      }
-
-      // Arrow keys (only meaningful when command list is shown)
-      if (showCommands) {
-        const filtered = getFilteredCommands();
-        if (key === "\x1b[A" || key === "\u001bOA") { // Up
-          selectedIndex = Math.max(0, selectedIndex - 1);
-          render();
-          return;
-        }
-        if (key === "\x1b[B" || key === "\u001bOB") { // Down
-          selectedIndex = Math.min(filtered.length - 1, selectedIndex + 1);
-          render();
-          return;
-        }
-        if (key === "\x1b[D" || key === "\u001bOD") { // Left
-          if (cursorPos > 0) cursorPos--;
-          render();
-          return;
-        }
-        if (key === "\x1b[C" || key === "\u001bOC") { // Right
-          if (cursorPos < buffer.length) cursorPos++;
-          render();
-          return;
-        }
-        if (key === "\t" && filtered.length > 0) { // Tab to autocomplete
-          buffer = filtered[selectedIndex].cmd;
-          cursorPos = buffer.length;
-          showCommands = false;
-          render();
-          return;
-        }
-      }
-
-      // Regular character
-      if (key.length === 1 && code >= 32) {
-        // Insert character at cursor position
-        buffer = buffer.slice(0, cursorPos) + key + buffer.slice(cursorPos);
-        cursorPos++;
-        
-        // Show command list when "/" is typed
-        if (buffer === "/") {
-          showCommands = true;
-          selectedIndex = 0;
-        } else if (showCommands && !buffer.startsWith("/")) {
-          showCommands = false;
-        } else if (showCommands) {
-          // Update selected index based on typing
-          const filtered = getFilteredCommands();
-          if (filtered.length > 0) {
-            selectedIndex = Math.min(selectedIndex, filtered.length - 1);
-          }
-        }
-        
-        render();
-        return;
-      }
+    // Tab completer for slash commands
+    const completer = (line: string): [string[], string] => {
+      if (!line.startsWith("/")) return [[], line];
+      const hits = SLASH_COMMANDS
+        .map(c => c.cmd)
+        .filter(cmd => cmd.startsWith(line));
+      return [hits.length ? hits : SLASH_COMMANDS.map(c => c.cmd), line];
     };
 
-    // Cleanup function to restore terminal
-    function cleanup() {
-      process.stdin.removeListener("data", onKey);
-      process.stdout.removeListener("resize", onResize);
-      process.stdout.write("\x1B[?1049l"); // Restore normal screen buffer
-      process.stdout.write("\x1B[?25h");   // Show cursor
-      if (!originalRaw) {
-        process.stdin.setRawMode(false);
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      terminal: true,
+      completer,
+      history,
+    });
+
+    // Show a one-line hint when the user types exactly "/"
+    let hintShown = false;
+    const onKeypress = () => {
+      const line = rl.line;
+      if (line === "/" && !hintShown) {
+        hintShown = true;
+        const hint = SLASH_COMMANDS.map(c => `${c.cmd} ${pc.dim(c.desc)}`).join("  ");
+        // Save cursor, move to next line, print hint, restore cursor
+        process.stdout.write(`\x1B[s\n\x1B[2K${pc.dim(hint)}\x1B[u`);
+      } else if (line !== "/" && hintShown) {
+        hintShown = false;
+        // Clear the hint line: save cursor, move down, erase line, restore cursor
+        process.stdout.write(`\x1B[s\n\x1B[2K\x1B[u`);
       }
-    }
-
-    // Set up input listener
-    process.stdin.on("data", onKey);
-
-    // Handle window resize - re-render to fix line calculations
-    const onResize = () => {
-      render();
     };
-    process.stdout.on("resize", onResize);
+    process.stdin.on("keypress", onKeypress);
 
-    // Initial render
-    render();
+    rl.question(promptText).then((value: string) => {
+      process.stdin.removeListener("keypress", onKeypress);
+      // Clear any leftover hint line
+      if (hintShown) {
+        process.stdout.write(`\x1B[1B\x1B[2K\x1B[1A`);
+      }
+      // Snapshot history from the readline instance
+      const updatedHistory = (rl as unknown as { history: string[] }).history
+        ? [...(rl as unknown as { history: string[] }).history]
+        : [...history, ...(value.trim() ? [value] : [])];
+      rl.close();
+      resolve({ type: "input", value, history: updatedHistory });
+    }).catch(() => {
+      process.stdin.removeListener("keypress", onKeypress);
+      rl.close();
+      resolve(null);
+    });
   });
 }
 

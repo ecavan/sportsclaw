@@ -75,7 +75,12 @@ import {
 } from "./approval.js";
 import { isGuideIntent, generateGuideResponse } from "./guide.js";
 import { createTask, listTasks, completeTask } from "./taskbus.js";
-import { renderChart, type ChartType } from "./charts.js";
+import { renderChart, type ChartType, type BracketMatch } from "./charts.js";
+import {
+  createBracket, loadBracket, saveBracket, listBrackets, deleteBracket,
+  makePick, getBracketProgress, getNextMatchups, toBracketChartData,
+  type BracketTeam, type BracketSession, type BracketRegionName, REGIONS,
+} from "./bracket.js";
 import { subagentManager, type SubagentResult } from "./subagent.js";
 import { heartbeatService } from "./heartbeat.js";
 
@@ -131,6 +136,9 @@ Your core directives:
    - \`bars\`: horizontal bars for comparing named categories (e.g., team stats)
    - \`columns\`: vertical columns for small datasets
    - \`braille\`: high-density dot plot for compact trend visualization
+   - \`heatmap\`: heat intensity grid for correlation matrices or schedule data
+   - \`unicode\`: Unicode block chart for multi-series comparison
+   - \`bracket\`: tournament bracket tree (requires bracketData instead of data)
    NEVER use markdown tables for statistical comparisons, leaderboards, or time-series data. You MUST use the \`render_chart\` tool.
    Always fetch the data with sports tools first, then visualize the results. Do not use render_chart without data.
 9. FAN PROFILE — When you see a Fan Profile in [MEMORY], use it to:
@@ -156,6 +164,14 @@ Your core directives:
     - FAN_PROFILE.md: entity-level data only. No prose.
     Each file should stay small enough to skim in seconds.
 12.5 KALSHI MASCOTS — When searching Kalshi markets via search_markets, you CAN use team mascots (e.g. Lakers, Pelicans) as the query as long as you provide the correct sport code. The tool will auto-translate it to city names behind the scenes.
+12.6 BRACKET BUILDING — When the user wants to fill out a March Madness bracket:
+    - First fetch the tournament field with cbb_get_rankings or cbb_get_futures
+    - Call bracket_create with the 64-team field (4 regions × 16 seeds)
+    - Present picks REGION BY REGION: complete all 4 rounds (R64→E8) of one region before moving on
+    - Use ask_user_question for each matchup — include seed numbers in labels
+    - After completing each region, show bracket_view for that region
+    - The user can resume later — bracket state persists across sessions
+    - When user says "show my bracket" or "resume bracket", call bracket_status first
 13. FAILURE DISCIPLINE — If any requested data tool fails, you MUST:
     - Explicitly mark that section as unavailable.
     - Avoid analysis or conclusions for the failed data dimension.
@@ -1586,6 +1602,7 @@ export class sportsclawEngine {
     // -----------------------------------------------------------------
 
     const watcherUserId = runUserId ?? "anonymous";
+    const bracketUserId = runUserId ?? "anonymous";
 
     toolMap["create_task"] = defineTool({
       description:
@@ -2089,12 +2106,15 @@ export class sportsclawEngine {
         "Render a terminal-friendly chart from numeric data. Use this to visualize " +
         "trends, comparisons, and distributions instead of listing raw numbers.\n" +
         "Chart types:\n" +
-        "- ascii: Line chart with box-drawing characters (best for trends over time)\n" +
+        "- ascii: Line chart with scatter symbols (best for trends over time)\n" +
         "- spark: Compact single-row sparkline (best for inline trend summaries)\n" +
         "- bars: Horizontal bar chart (best for comparing named categories)\n" +
         "- columns: Vertical column chart (best for small datasets)\n" +
         "- braille: High-resolution braille dot plot (compact trend visualization)\n" +
-        "- svg: Raw SVG output (for downstream rendering in chat apps)",
+        "- heatmap: Heat intensity grid (best for correlation matrices or schedule data)\n" +
+        "- unicode: Unicode block chart (multi-series side-by-side comparison)\n" +
+        "- svg: Raw SVG output (for downstream rendering in chat apps)\n" +
+        "- bracket: Tournament bracket tree (requires bracketData instead of data)",
       inputSchema: jsonSchema({
         type: "object",
         properties: {
@@ -2102,11 +2122,11 @@ export class sportsclawEngine {
             type: "array",
             items: { type: "number" },
             description:
-              "Numeric data to chart. Accepts number[] (single series) or number[][] (multi-series).",
+              "Numeric data to chart. Accepts number[] (single series) or number[][] (multi-series). Not required for bracket charts.",
           },
           chartType: {
             type: "string",
-            enum: ["ascii", "spark", "bars", "columns", "braille", "svg"],
+            enum: ["ascii", "spark", "bars", "columns", "braille", "svg", "heatmap", "unicode", "bracket"],
             description: "Type of chart to render.",
           },
           xAxisLabel: {
@@ -2121,14 +2141,41 @@ export class sportsclawEngine {
             type: "array",
             items: { type: "string" },
             description:
-              "Labels for each data point (used in bars/columns charts).",
+              "Labels for each data point (used in bars/columns/heatmap charts).",
+          },
+          seriesLabels: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Labels for each data series (used in multi-series charts and bar/column category names).",
           },
           height: {
             type: "number",
-            description: "Chart height in terminal rows. Default: 12 for ascii, 8 for columns/braille.",
+            description: "Chart height in terminal rows. Default: 15 for ascii, 8 for columns/braille/unicode.",
+          },
+          width: {
+            type: "number",
+            description: "Chart width in characters. Default: 28 for bars, 40 for braille, 320 for svg.",
+          },
+          bracketData: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                round: { type: "number", description: "Round number (1 = first round)." },
+                matchIndex: { type: "number", description: "Match index within the round (0-based)." },
+                team1: { type: "string", description: "Name of team 1." },
+                team2: { type: "string", description: "Name of team 2." },
+                score1: { type: "number", description: "Score of team 1." },
+                score2: { type: "number", description: "Score of team 2." },
+                winner: { type: "number", description: "Winner: 1 for team1, 2 for team2." },
+              },
+              required: ["round", "matchIndex", "team1", "team2"],
+            },
+            description: "Tournament bracket match data (required for bracket chart type).",
           },
         },
-        required: ["data", "chartType"],
+        required: ["chartType"],
       }),
       execute: async (args: {
         data?: number[] | number[][];
@@ -2136,31 +2183,407 @@ export class sportsclawEngine {
         xAxisLabel?: string;
         yAxisLabel?: string;
         xLabels?: string[];
+        seriesLabels?: string[];
         height?: number;
+        width?: number;
+        bracketData?: BracketMatch[];
       }) => {
-        if (!args.data || !Array.isArray(args.data) || args.data.length === 0) {
-          return "Error: data must be a non-empty array of numbers.";
-        }
         if (!args.chartType) {
           return "Error: chartType is required.";
         }
-        const validTypes = ["ascii", "spark", "bars", "columns", "braille", "svg"];
+        const validTypes = ["ascii", "spark", "bars", "columns", "braille", "svg", "heatmap", "unicode", "bracket"];
         if (!validTypes.includes(args.chartType)) {
           return `Error: unknown chartType "${args.chartType}". Valid: ${validTypes.join(", ")}`;
         }
 
+        if (args.chartType === "bracket") {
+          if (!args.bracketData || !Array.isArray(args.bracketData) || args.bracketData.length === 0) {
+            return "Error: bracketData must be a non-empty array of match objects for bracket charts.";
+          }
+        } else {
+          if (!args.data || !Array.isArray(args.data) || args.data.length === 0) {
+            return "Error: data must be a non-empty array of numbers.";
+          }
+        }
+
         try {
           const result = renderChart({
-            data: args.data,
+            data: args.data ?? [],
             chartType: args.chartType as ChartType,
             xAxisLabel: args.xAxisLabel,
             yAxisLabel: args.yAxisLabel,
             xLabels: args.xLabels,
+            seriesLabels: args.seriesLabels,
             height: args.height,
+            width: args.width,
+            bracketData: args.bracketData,
           });
           return "```\n" + result + "\n```";
         } catch (error) {
           return `Chart rendering failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      },
+    });
+
+    // -----------------------------------------------------------------
+    // March Madness Bracket Builder
+    // -----------------------------------------------------------------
+
+    toolMap["bracket_create"] = defineTool({
+      description:
+        "Start a new March Madness bracket session. Provide the 64-team " +
+        "field (4 regions × 16 seeds). The bracket is saved to disk and " +
+        "can be resumed across sessions.",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          teams: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                seed: { type: "number", description: "Seed number 1-16." },
+                name: { type: "string", description: "Team name." },
+                teamId: { type: "string", description: "ESPN team ID (optional)." },
+                region: {
+                  type: "string",
+                  enum: ["East", "West", "South", "Midwest"],
+                  description: "Tournament region.",
+                },
+              },
+              required: ["seed", "name", "region"],
+            },
+            description: "Array of 64 teams (16 per region).",
+          },
+          name: {
+            type: "string",
+            description: "Optional bracket name (e.g., 'My 2025 Bracket').",
+          },
+          year: {
+            type: "number",
+            description: "Tournament year. Defaults to current year.",
+          },
+        },
+        required: ["teams"],
+      }),
+      execute: async (args: {
+        teams?: BracketTeam[];
+        name?: string;
+        year?: number;
+      }) => {
+        if (!args.teams || !Array.isArray(args.teams)) {
+          return "Error: teams must be an array of 64 team objects.";
+        }
+        try {
+          const session = await createBracket({
+            userId: bracketUserId,
+            teams: args.teams,
+            name: args.name,
+            year: args.year,
+            seedSource: "espn",
+          });
+          const progress = getBracketProgress(session);
+          return JSON.stringify({
+            status: "created",
+            bracketId: session.id,
+            name: session.name,
+            year: session.year,
+            totalMatchups: session.totalMatchups,
+            currentRound: progress.currentRound,
+            message: `Bracket "${session.name}" created with ${session.totalMatchups} matchups. Start picking!`,
+          });
+        } catch (error) {
+          return `Error creating bracket: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      },
+    });
+
+    toolMap["bracket_pick"] = defineTool({
+      description:
+        "Make a pick for a specific matchup in a bracket. The winner is " +
+        "propagated to the next round. If changing a previous pick, downstream " +
+        "picks involving the eliminated team are automatically cleared.",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          bracket_id: {
+            type: "string",
+            description: "The bracket session ID.",
+          },
+          match_id: {
+            type: "string",
+            description: "The matchup ID (e.g., 'east-r1-m0').",
+          },
+          pick: {
+            type: "string",
+            enum: ["top", "bottom"],
+            description: "Pick the top seed or bottom seed to advance.",
+          },
+        },
+        required: ["bracket_id", "match_id", "pick"],
+      }),
+      execute: async (args: {
+        bracket_id?: string;
+        match_id?: string;
+        pick?: string;
+      }) => {
+        if (!args.bracket_id || !args.match_id || !args.pick) {
+          return "Error: bracket_id, match_id, and pick are all required.";
+        }
+        if (args.pick !== "top" && args.pick !== "bottom") {
+          return 'Error: pick must be "top" or "bottom".';
+        }
+        try {
+          const session = await loadBracket(bracketUserId, args.bracket_id);
+          if (!session) {
+            return `Error: bracket "${args.bracket_id}" not found.`;
+          }
+          const { session: updated, cascadeCleared } = makePick(
+            session,
+            args.match_id,
+            args.pick as "top" | "bottom",
+          );
+          await saveBracket(updated);
+          const progress = getBracketProgress(updated);
+          const result: Record<string, unknown> = {
+            status: "picked",
+            matchId: args.match_id,
+            pick: args.pick,
+            picksCompleted: progress.picksCompleted,
+            totalMatchups: progress.totalMatchups,
+            percentage: progress.percentage,
+            currentRound: progress.currentRound,
+          };
+          if (cascadeCleared.length > 0) {
+            result.warning = `Pick change cleared ${cascadeCleared.length} downstream pick(s): ${cascadeCleared.join(", ")}`;
+          }
+          if (updated.champion) {
+            result.champion = `${updated.champion.name} (${updated.champion.seed} seed, ${updated.champion.region})`;
+          }
+          return JSON.stringify(result);
+        } catch (error) {
+          return `Error making pick: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      },
+    });
+
+    toolMap["bracket_view"] = defineTool({
+      description:
+        "View a bracket — renders a visual bracket chart. Can show a " +
+        "specific region or the Final Four. Also returns progress info.",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          bracket_id: {
+            type: "string",
+            description: "The bracket session ID.",
+          },
+          region: {
+            type: "string",
+            enum: ["East", "West", "South", "Midwest", "Final Four"],
+            description:
+              "View a specific region or 'Final Four'. Omit for full bracket summary.",
+          },
+        },
+        required: ["bracket_id"],
+      }),
+      execute: async (args: {
+        bracket_id?: string;
+        region?: string;
+      }) => {
+        if (!args.bracket_id) {
+          return "Error: bracket_id is required.";
+        }
+        try {
+          const session = await loadBracket(bracketUserId, args.bracket_id);
+          if (!session) {
+            return `Error: bracket "${args.bracket_id}" not found.`;
+          }
+          const progress = getBracketProgress(session);
+          const parts: string[] = [];
+
+          if (args.region) {
+            const chartData = toBracketChartData(
+              session,
+              args.region as BracketRegionName | "Final Four",
+            );
+            const chart = renderChart({
+              data: [],
+              chartType: "bracket",
+              bracketData: chartData,
+            });
+            parts.push(`## ${args.region} Region`);
+            parts.push("```\n" + chart + "\n```");
+          } else {
+            // Show all 4 regions + Final Four
+            for (const region of REGIONS) {
+              const chartData = toBracketChartData(session, region);
+              const chart = renderChart({
+                data: [],
+                chartType: "bracket",
+                bracketData: chartData,
+              });
+              parts.push(`## ${region} Region`);
+              parts.push("```\n" + chart + "\n```");
+            }
+            const ffData = toBracketChartData(session, "Final Four");
+            const ffChart = renderChart({
+              data: [],
+              chartType: "bracket",
+              bracketData: ffData,
+            });
+            parts.push("## Final Four & Championship");
+            parts.push("```\n" + ffChart + "\n```");
+          }
+
+          parts.push(
+            `\n**Progress:** ${progress.picksCompleted}/${progress.totalMatchups} (${progress.percentage}%)` +
+              ` | **Current Round:** ${progress.currentRound}` +
+              (progress.regionsComplete.length > 0
+                ? ` | **Regions Complete:** ${progress.regionsComplete.join(", ")}`
+                : "") +
+              (progress.champion
+                ? ` | **Champion:** ${progress.champion.name}`
+                : ""),
+          );
+
+          return parts.join("\n\n");
+        } catch (error) {
+          return `Error viewing bracket: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      },
+    });
+
+    toolMap["bracket_status"] = defineTool({
+      description:
+        "Check bracket progress or list all brackets for the user. " +
+        "If bracket_id is provided, returns detailed progress. " +
+        "Otherwise lists all user brackets.",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          bracket_id: {
+            type: "string",
+            description:
+              "Optional bracket ID. If omitted, lists all user brackets.",
+          },
+        },
+      }),
+      execute: async (args: { bracket_id?: string }) => {
+        try {
+          if (args.bracket_id) {
+            const session = await loadBracket(bracketUserId, args.bracket_id);
+            if (!session) {
+              return `Error: bracket "${args.bracket_id}" not found.`;
+            }
+            const progress = getBracketProgress(session);
+            const nextUp = getNextMatchups(session, { limit: 3 });
+            return JSON.stringify({
+              bracketId: session.id,
+              name: session.name,
+              year: session.year,
+              status: session.status,
+              ...progress,
+              nextMatchups: nextUp.map((m) => ({
+                matchId: m.matchId,
+                round: m.roundName,
+                region: m.region,
+                topSeed: m.topSeed
+                  ? `(${m.topSeed.seed}) ${m.topSeed.name}`
+                  : "TBD",
+                bottomSeed: m.bottomSeed
+                  ? `(${m.bottomSeed.seed}) ${m.bottomSeed.name}`
+                  : "TBD",
+              })),
+            });
+          }
+
+          // List all brackets
+          const brackets = await listBrackets(bracketUserId);
+          if (brackets.length === 0) {
+            return "No brackets found. Use bracket_create to start one.";
+          }
+          return JSON.stringify(
+            brackets.map((b) => {
+              const p = getBracketProgress(b);
+              return {
+                bracketId: b.id,
+                name: b.name,
+                year: b.year,
+                status: b.status,
+                progress: `${p.picksCompleted}/${p.totalMatchups} (${p.percentage}%)`,
+                currentRound: p.currentRound,
+                champion: p.champion?.name ?? null,
+              };
+            }),
+          );
+        } catch (error) {
+          return `Error checking bracket status: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      },
+    });
+
+    toolMap["bracket_reset"] = defineTool({
+      description:
+        "Reset all picks in a bracket (keeping the team field intact) " +
+        "or delete the bracket entirely.",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {
+          bracket_id: {
+            type: "string",
+            description: "The bracket session ID.",
+          },
+          mode: {
+            type: "string",
+            enum: ["reset_picks", "delete"],
+            description: "'reset_picks' clears all picks. 'delete' removes the bracket.",
+          },
+        },
+        required: ["bracket_id", "mode"],
+      }),
+      execute: async (args: {
+        bracket_id?: string;
+        mode?: string;
+      }) => {
+        if (!args.bracket_id || !args.mode) {
+          return "Error: bracket_id and mode are required.";
+        }
+        try {
+          if (args.mode === "delete") {
+            const deleted = await deleteBracket(bracketUserId, args.bracket_id);
+            return deleted
+              ? `Bracket "${args.bracket_id}" deleted.`
+              : `Bracket "${args.bracket_id}" not found.`;
+          }
+
+          if (args.mode === "reset_picks") {
+            const session = await loadBracket(bracketUserId, args.bracket_id);
+            if (!session) {
+              return `Error: bracket "${args.bracket_id}" not found.`;
+            }
+            // Reset all picks and clear propagated seeds (R2+)
+            for (const m of session.matchups) {
+              m.pick = null;
+              if (m.round > 1) {
+                m.topSeed = null;
+                m.bottomSeed = null;
+              }
+            }
+            session.picksCompleted = 0;
+            session.champion = null;
+            session.status = "in_progress";
+            await saveBracket(session);
+            return JSON.stringify({
+              status: "reset",
+              bracketId: session.id,
+              message: "All picks cleared. Team field preserved.",
+            });
+          }
+
+          return `Error: unknown mode "${args.mode}". Use "reset_picks" or "delete".`;
+        } catch (error) {
+          return `Error resetting bracket: ${error instanceof Error ? error.message : String(error)}`;
         }
       },
     });
