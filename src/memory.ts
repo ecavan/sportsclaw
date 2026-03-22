@@ -1,7 +1,7 @@
 /**
- * sportsclaw — Markdown Persistent Memory (OpenClaw Architecture)
+ * sportsclaw — Persistent Memory with Pluggable Storage
  *
- * A 6-file memory system using plain .md files, each with a single purpose:
+ * A 6-file memory system, each with a single purpose:
  *
  *   CONTEXT.md       — HOT:  ephemeral state snapshot (overwritten on context shifts)
  *   SOUL.md          — WARM: agent personality & relationship with this user (evolves)
@@ -10,23 +10,17 @@
  *   STRATEGY.md      — WARM: self-authored behavioral directives (injected into system prompt)
  *   <date>.md        — WARM/COLD: append-only conversation archive
  *
- * Storage layout:
- *   ~/.sportsclaw/memory/<userId>/CONTEXT.md
- *   ~/.sportsclaw/memory/<userId>/SOUL.md
- *   ~/.sportsclaw/memory/<userId>/FAN_PROFILE.md
- *   ~/.sportsclaw/memory/<userId>/REFLECTIONS.md
- *   ~/.sportsclaw/memory/<userId>/STRATEGY.md
- *   ~/.sportsclaw/memory/<userId>/2026-02-25.md
+ * Storage backends:
+ *   FileMemoryStorage — local ~/.sportsclaw/memory/<userId>/ (default, open-source CLI)
+ *   PodMemoryStorage  — Machina MCP pod documents (multi-tenant relay deployments)
  *
- * No SQLite. No JSON blobs. Just markdown.
- *
- * All file I/O is async to avoid blocking the Node.js event loop under
- * concurrent bot traffic (Discord/Telegram listeners).
+ * Backend is selected once at MemoryManager construction — no hybrid, no sync.
  */
 
 import { mkdir, readFile, writeFile, appendFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import type { McpManager } from "./mcp.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -79,14 +73,20 @@ export interface ThreadMessage {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Storage Interface
 // ---------------------------------------------------------------------------
 
-/** Get today's date as YYYY-MM-DD */
-function todayStamp(): string {
-  const d = new Date();
-  return d.toISOString().slice(0, 10);
+export interface MemoryStorage {
+  read(userId: string, file: string): Promise<string>;
+  write(userId: string, file: string, content: string): Promise<void>;
+  append(userId: string, file: string, content: string): Promise<void>;
+  list(userId: string, pattern: string): Promise<string[]>;
+  remove(userId: string, file: string): Promise<void>;
 }
+
+// ---------------------------------------------------------------------------
+// FileMemoryStorage — local filesystem (default)
+// ---------------------------------------------------------------------------
 
 /**
  * Read a file, returning empty string if it doesn't exist.
@@ -103,6 +103,241 @@ async function safeRead(path: string): Promise<string> {
   }
 }
 
+/**
+ * Sanitize a user/thread ID for safe use as a directory name.
+ * Uses a hash suffix when characters are replaced to reduce collision risk.
+ */
+function sanitizeId(id: string): string {
+  const safe = id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 128);
+  if (safe !== id) {
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) {
+      hash = ((hash << 5) - hash + id.charCodeAt(i)) | 0;
+    }
+    const suffix = Math.abs(hash).toString(36).slice(0, 6);
+    return `${safe.slice(0, 121)}_${suffix}`;
+  }
+  return safe;
+}
+
+class FileMemoryStorage implements MemoryStorage {
+  private base: string;
+  private dirCache = new Set<string>();
+
+  constructor(base: string) {
+    this.base = base;
+  }
+
+  private userDir(userId: string): string {
+    return join(this.base, sanitizeId(userId));
+  }
+
+  private async ensureDir(userId: string): Promise<string> {
+    const dir = this.userDir(userId);
+    if (!this.dirCache.has(dir)) {
+      await mkdir(dir, { recursive: true });
+      this.dirCache.add(dir);
+    }
+    return dir;
+  }
+
+  async read(userId: string, file: string): Promise<string> {
+    const dir = await this.ensureDir(userId);
+    return safeRead(join(dir, file));
+  }
+
+  async write(userId: string, file: string, content: string): Promise<void> {
+    const dir = await this.ensureDir(userId);
+    await writeFile(join(dir, file), content, "utf-8");
+  }
+
+  async append(userId: string, file: string, content: string): Promise<void> {
+    const dir = await this.ensureDir(userId);
+    await appendFile(join(dir, file), content, "utf-8");
+  }
+
+  async list(userId: string, _pattern: string): Promise<string[]> {
+    const dir = await this.ensureDir(userId);
+    try {
+      const files = await readdir(dir);
+      return files
+        .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  async remove(userId: string, file: string): Promise<void> {
+    const dir = this.userDir(userId);
+    const { unlink } = await import("node:fs/promises");
+    try {
+      await unlink(join(dir, file));
+    } catch {
+      // Skip files that can't be deleted
+    }
+  }
+
+  /** Absolute path to a user's memory directory */
+  getUserDir(userId: string): string {
+    return this.userDir(userId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PodMemoryStorage — Machina MCP pod documents
+// ---------------------------------------------------------------------------
+
+/** Map memory filenames to document metadata types */
+const FILE_TYPE_MAP: Record<string, string> = {
+  SOUL: "soul",
+  FAN_PROFILE: "fan-profile",
+  CONTEXT: "context",
+  REFLECTIONS: "reflections",
+  STRATEGY: "strategy",
+  CONSOLIDATED: "consolidated",
+  thread: "thread",
+};
+
+function parseMemoryFile(file: string): { memoryType: string; date?: string } {
+  const name = file.replace(/\.(md|json)$/, "");
+  const dateMatch = name.match(/^(\d{4}-\d{2}-\d{2})$/);
+  if (dateMatch) return { memoryType: "daily-log", date: dateMatch[1] };
+  return { memoryType: FILE_TYPE_MAP[name] ?? name.toLowerCase() };
+}
+
+export class PodMemoryStorage implements MemoryStorage {
+  constructor(private mcpManager: McpManager, private serverName: string) {}
+
+  async read(userId: string, file: string): Promise<string> {
+    try {
+      const { memoryType, date } = parseMemoryFile(file);
+      const filters: Record<string, unknown> = {
+        "metadata.type": "user-memory",
+        "metadata.user_id": userId,
+        "metadata.memory_type": memoryType,
+      };
+      if (date) filters["metadata.date"] = date;
+
+      const result = await this.callPod("search_documents", {
+        filters,
+        fields: ["_id", "content"],
+        page_size: 1,
+      });
+
+      return result?.data?.[0]?.content?.text ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  async write(userId: string, file: string, content: string): Promise<void> {
+    try {
+      const { memoryType, date } = parseMemoryFile(file);
+      const name = date
+        ? `memory-${userId}-daily-${date}`
+        : `memory-${userId}-${memoryType}`;
+
+      const metadata: Record<string, unknown> = {
+        type: "user-memory",
+        user_id: userId,
+        memory_type: memoryType,
+      };
+      if (date) metadata.date = date;
+
+      // Upsert: search first, update if exists, create if not
+      const existing = await this.callPod("search_documents", {
+        filters: {
+          "metadata.type": "user-memory",
+          "metadata.user_id": userId,
+          "metadata.memory_type": memoryType,
+          ...(date ? { "metadata.date": date } : {}),
+        },
+        fields: ["_id"],
+        page_size: 1,
+      });
+
+      if (existing?.data?.[0]) {
+        await this.callPod("update_document", {
+          item_id: existing.data[0]._id,
+          content: { text: content },
+        });
+      } else {
+        await this.callPod("create_document", { name, content: { text: content }, metadata });
+      }
+    } catch {
+      // Non-fatal: memory write failure shouldn't break the query
+    }
+  }
+
+  async append(userId: string, file: string, content: string): Promise<void> {
+    const existing = await this.read(userId, file);
+    await this.write(userId, file, existing ? `${existing}\n${content}` : content);
+  }
+
+  async list(userId: string, _pattern: string): Promise<string[]> {
+    try {
+      const result = await this.callPod("search_documents", {
+        filters: {
+          "metadata.type": "user-memory",
+          "metadata.user_id": userId,
+          "metadata.memory_type": "daily-log",
+        },
+        fields: ["metadata.date"],
+        sorters: [["metadata.date", 1]],
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (result?.data ?? []).map((d: any) => `${d.metadata.date}.md`);
+    } catch {
+      return [];
+    }
+  }
+
+  async remove(userId: string, file: string): Promise<void> {
+    try {
+      const { memoryType, date } = parseMemoryFile(file);
+      const filters: Record<string, unknown> = {
+        "metadata.type": "user-memory",
+        "metadata.user_id": userId,
+        "metadata.memory_type": memoryType,
+      };
+      if (date) filters["metadata.date"] = date;
+
+      const existing = await this.callPod("search_documents", {
+        filters,
+        fields: ["_id"],
+        page_size: 1,
+      });
+      if (existing?.data?.[0]) {
+        await this.callPod("delete_document", { item_id: existing.data[0]._id });
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async callPod(toolName: string, args: Record<string, unknown>): Promise<any> {
+    const result = await this.mcpManager.callToolDirect(this.serverName, toolName, args);
+    if (result.isError) return {};
+    try {
+      return JSON.parse(result.content || "{}");
+    } catch {
+      return {};
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Get today's date as YYYY-MM-DD */
+function todayStamp(): string {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+
 /** Format a timestamp for log entries */
 function timestamp(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
@@ -113,60 +348,44 @@ function timestamp(): string {
 // ---------------------------------------------------------------------------
 
 export class MemoryManager {
-  private dir: string;
+  private storage: MemoryStorage;
   private userId: string;
-  private dirReady: Promise<void>;
 
-  constructor(userId: string) {
+  constructor(userId: string, storage?: MemoryStorage) {
     this.userId = userId;
-    this.dir = join(MEMORY_BASE, sanitizeId(userId));
-    // Ensure directory exists asynchronously — callers await `ready()` or
-    // individual methods await it internally.
-    this.dirReady = mkdir(this.dir, { recursive: true }).then(() => {});
+    this.storage = storage ?? new FileMemoryStorage(MEMORY_BASE);
   }
 
-  /** Wait for the memory directory to be ready */
-  async ready(): Promise<void> {
-    await this.dirReady;
-  }
-
-  /** Absolute path to the user's memory directory */
+  /** Absolute path to the user's memory directory (only meaningful for file storage) */
   get memoryDir(): string {
-    return this.dir;
+    if (this.storage instanceof FileMemoryStorage) {
+      return this.storage.getUserDir(this.userId);
+    }
+    return join(MEMORY_BASE, sanitizeId(this.userId));
   }
 
   // -------------------------------------------------------------------------
   // HOT layer — CONTEXT.md
   // -------------------------------------------------------------------------
 
-  /** Read the user's current context snapshot */
   async readContext(): Promise<string> {
-    await this.dirReady;
-    return safeRead(join(this.dir, CONTEXT_FILE));
+    return this.storage.read(this.userId, CONTEXT_FILE);
   }
 
-  /** Overwrite the user's context snapshot */
   async writeContext(content: string): Promise<void> {
-    await this.dirReady;
-    await writeFile(join(this.dir, CONTEXT_FILE), content, "utf-8");
+    await this.storage.write(this.userId, CONTEXT_FILE, content);
   }
 
   // -------------------------------------------------------------------------
   // WARM layer — <date>.md
   // -------------------------------------------------------------------------
 
-  /** Read today's conversation log */
   async readTodayLog(): Promise<string> {
-    await this.dirReady;
-    return safeRead(join(this.dir, `${todayStamp()}.md`));
+    return this.storage.read(this.userId, `${todayStamp()}.md`);
   }
 
-  /** Append a user→assistant exchange to today's log */
   async appendExchange(userPrompt: string, assistantReply: string): Promise<void> {
-    await this.dirReady;
-    const logPath = join(this.dir, `${todayStamp()}.md`);
     const ts = timestamp();
-
     const entry = [
       `## [${ts}]`,
       "",
@@ -178,37 +397,27 @@ export class MemoryManager {
       "",
     ].join("\n");
 
-    await appendFile(logPath, entry, "utf-8");
+    await this.storage.append(this.userId, `${todayStamp()}.md`, entry);
   }
 
-  /** Append a raw note (e.g., tool output) to today's log */
   async appendNote(label: string, content: string): Promise<void> {
-    await this.dirReady;
-    const logPath = join(this.dir, `${todayStamp()}.md`);
     const ts = timestamp();
-
     const entry = [`> **${label}** (${ts}): ${content}`, ""].join("\n");
-
-    await appendFile(logPath, entry, "utf-8");
+    await this.storage.append(this.userId, `${todayStamp()}.md`, entry);
   }
 
   // -------------------------------------------------------------------------
   // WARM layer — SOUL.md (agent personality & relationship)
   // -------------------------------------------------------------------------
 
-  /** Read the raw soul markdown */
   async readSoul(): Promise<string> {
-    await this.dirReady;
-    return safeRead(join(this.dir, SOUL_FILE));
+    return this.storage.read(this.userId, SOUL_FILE);
   }
 
-  /** Write the soul file. Content is fully LLM-authored markdown. */
   async writeSoul(content: string): Promise<void> {
-    await this.dirReady;
-    await writeFile(join(this.dir, SOUL_FILE), content, "utf-8");
+    await this.storage.write(this.userId, SOUL_FILE, content);
   }
 
-  /** Parse just the header fields (Born/Exchanges) from SOUL.md */
   parseSoulHeader(raw: string): SoulData {
     const data: SoulData = { born: new Date().toISOString(), exchanges: 0, rest: "" };
     if (!raw.trim()) return data;
@@ -233,78 +442,58 @@ export class MemoryManager {
     return data;
   }
 
-  /**
-   * Increment the exchange counter on SOUL.md.
-   * Called post-response — the only thing code touches automatically.
-   * Creates the soul file on first interaction.
-   */
   async incrementSoulExchanges(): Promise<void> {
-    await this.dirReady;
     const raw = await this.readSoul();
     const data = this.parseSoulHeader(raw);
     data.exchanges++;
 
     const header = `# Soul\nBorn: ${data.born}\nExchanges: ${data.exchanges}\n`;
     const content = data.rest ? `${header}\n${data.rest}\n` : header;
-    await writeFile(join(this.dir, SOUL_FILE), content, "utf-8");
+    await this.storage.write(this.userId, SOUL_FILE, content);
   }
 
   // -------------------------------------------------------------------------
   // WARM layer — FAN_PROFILE.md
   // -------------------------------------------------------------------------
 
-  /** Read the raw fan profile markdown */
   async readFanProfile(): Promise<string> {
-    await this.dirReady;
-    return safeRead(join(this.dir, FAN_PROFILE_FILE));
+    return this.storage.read(this.userId, FAN_PROFILE_FILE);
   }
 
-  /** Write the fan profile. Content is fully LLM-authored markdown. */
   async writeFanProfile(content: string): Promise<void> {
-    await this.dirReady;
-    await writeFile(join(this.dir, FAN_PROFILE_FILE), content, "utf-8");
+    await this.storage.write(this.userId, FAN_PROFILE_FILE, content);
   }
 
   // -------------------------------------------------------------------------
   // WARM layer — REFLECTIONS.md (append-only lessons learned)
   // -------------------------------------------------------------------------
 
-  /** Read the reflections log */
   async readReflections(): Promise<string> {
-    await this.dirReady;
-    return safeRead(join(this.dir, REFLECTIONS_FILE));
+    return this.storage.read(this.userId, REFLECTIONS_FILE);
   }
 
-  /** Append a structured reflection entry */
   async appendReflection(entry: string): Promise<void> {
-    await this.dirReady;
-    await appendFile(join(this.dir, REFLECTIONS_FILE), entry + "\n", "utf-8");
+    await this.storage.append(this.userId, REFLECTIONS_FILE, entry + "\n");
   }
 
   // -------------------------------------------------------------------------
   // WARM layer — STRATEGY.md (self-authored behavioral directives)
   // -------------------------------------------------------------------------
 
-  /** Read the strategy file */
   async readStrategy(): Promise<string> {
-    await this.dirReady;
-    return safeRead(join(this.dir, STRATEGY_FILE));
+    return this.storage.read(this.userId, STRATEGY_FILE);
   }
 
-  /** Write the strategy file. Content is fully LLM-authored markdown. */
   async writeStrategy(content: string): Promise<void> {
-    await this.dirReady;
-    await writeFile(join(this.dir, STRATEGY_FILE), content, "utf-8");
+    await this.storage.write(this.userId, STRATEGY_FILE, content);
   }
 
   // -------------------------------------------------------------------------
   // Thread persistence — conversation history across process restarts
   // -------------------------------------------------------------------------
 
-  /** Read the persisted conversation thread from disk */
   async readThread(): Promise<ThreadMessage[]> {
-    await this.dirReady;
-    const raw = await safeRead(join(this.dir, THREAD_FILE));
+    const raw = await this.storage.read(this.userId, THREAD_FILE);
     if (!raw) return [];
     try {
       return JSON.parse(raw);
@@ -313,14 +502,11 @@ export class MemoryManager {
     }
   }
 
-  /** Write a conversation thread to disk, capping at MAX_THREAD_MESSAGES */
   async writeThread(messages: ThreadMessage[]): Promise<void> {
-    await this.dirReady;
     const capped = messages.slice(-MAX_THREAD_MESSAGES);
-    await writeFile(join(this.dir, THREAD_FILE), JSON.stringify(capped), "utf-8");
+    await this.storage.write(this.userId, THREAD_FILE, JSON.stringify(capped));
   }
 
-  /** Append a user/assistant exchange to the persisted thread */
   async appendToThread(userPrompt: string, assistantReply: string): Promise<void> {
     const thread = await this.readThread();
     const ts = new Date().toISOString();
@@ -335,42 +521,18 @@ export class MemoryManager {
   // CONSOLIDATED.md — compressed knowledge from old daily logs
   // -------------------------------------------------------------------------
 
-  /** Read the consolidated memory file */
   async readConsolidated(): Promise<string> {
-    await this.dirReady;
-    return safeRead(join(this.dir, CONSOLIDATED_FILE));
+    return this.storage.read(this.userId, CONSOLIDATED_FILE);
   }
 
-  /** Write the consolidated memory file */
   async writeConsolidated(content: string): Promise<void> {
-    await this.dirReady;
-    await writeFile(join(this.dir, CONSOLIDATED_FILE), content, "utf-8");
+    await this.storage.write(this.userId, CONSOLIDATED_FILE, content);
   }
 
-  /**
-   * List daily log files (YYYY-MM-DD.md) in this user's memory directory.
-   * Returns filenames sorted by date (oldest first).
-   */
   async listDailyLogs(): Promise<string[]> {
-    await this.dirReady;
-    try {
-      const files = await readdir(this.dir);
-      return files
-        .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
-        .sort();
-    } catch {
-      return [];
-    }
+    return this.storage.list(this.userId, "daily-log");
   }
 
-  /**
-   * Gather old daily logs eligible for consolidation.
-   *
-   * Returns the filenames and combined content of logs older than
-   * `ageDays` (default: 3 days). Excludes today's log.
-   *
-   * @param ageDays  Minimum age in days for a log to be consolidation-eligible
-   */
   async getConsolidationCandidates(
     ageDays: number = DEFAULT_CONSOLIDATION_AGE_DAYS
   ): Promise<{ files: string[]; content: string; totalChars: number }> {
@@ -388,10 +550,9 @@ export class MemoryManager {
       const dateStr = file.replace(".md", "");
       if (dateStr >= cutoffStamp || dateStr === today) continue;
 
-      const content = await safeRead(join(this.dir, file));
+      const content = await this.storage.read(this.userId, file);
       if (!content.trim()) continue;
 
-      // Respect max input size — don't send unbounded content to LLM
       if (totalChars + content.length > MAX_CONSOLIDATION_INPUT_CHARS) break;
 
       eligibleFiles.push(file);
@@ -406,22 +567,6 @@ export class MemoryManager {
     };
   }
 
-  /**
-   * Consolidate old daily logs into CONSOLIDATED.md.
-   *
-   * This is a two-phase operation:
-   *   1. Gather eligible logs (older than `ageDays`)
-   *   2. Use the provided summarizer function to compress them
-   *   3. Merge the summary into CONSOLIDATED.md
-   *   4. Delete the source log files
-   *
-   * The `summarize` function is injected to keep this module free of
-   * LLM dependencies — the engine provides the actual LLM call.
-   *
-   * @param summarize  Async function that compresses log content into a summary
-   * @param ageDays    Minimum age in days (default: 3)
-   * @returns Number of log files consolidated, or 0 if nothing to do
-   */
   async consolidateOldLogs(
     summarize: (content: string, existingSummary: string) => Promise<string>,
     ageDays: number = DEFAULT_CONSOLIDATION_AGE_DAYS
@@ -429,24 +574,14 @@ export class MemoryManager {
     const candidates = await this.getConsolidationCandidates(ageDays);
     if (candidates.files.length === 0) return 0;
 
-    // Read existing consolidated knowledge
     const existing = await this.readConsolidated();
-
-    // Ask the LLM to merge old logs into a compressed summary
     const summary = await summarize(candidates.content, existing);
     if (!summary.trim()) return 0;
 
-    // Write the merged consolidated file
     await this.writeConsolidated(summary);
 
-    // Delete the source log files
-    const { unlink } = await import("node:fs/promises");
     for (const file of candidates.files) {
-      try {
-        await unlink(join(this.dir, file));
-      } catch {
-        // Skip files that can't be deleted (e.g., already removed)
-      }
+      await this.storage.remove(this.userId, file);
     }
 
     return candidates.files.length;
@@ -456,13 +591,6 @@ export class MemoryManager {
   // Combined read for prompt injection-safe context assembly
   // -------------------------------------------------------------------------
 
-  /**
-   * Build a memory block suitable for injection into the conversation.
-   *
-   * Returns empty string if the user has no memory yet.
-   * Content is intended to be injected as a *user-role* message (not system)
-   * to reduce prompt injection surface area.
-   */
   async buildMemoryBlock(): Promise<string> {
     const [context, todayLog, fanProfile, soul, reflections, consolidated] = await Promise.all([
       this.readContext(),
@@ -480,12 +608,10 @@ export class MemoryManager {
       `User ID: ${this.userId}`,
     ];
 
-    // Soul first — shapes how the agent talks
     if (soul) {
       parts.push("", "### Soul (SOUL.md)", soul);
     }
 
-    // Fan profile second — shapes what content to fetch
     if (fanProfile) {
       parts.push("", "### Fan Profile (FAN_PROFILE.md)", fanProfile);
     }
@@ -494,20 +620,17 @@ export class MemoryManager {
       parts.push("", "### Current Context (CONTEXT.md)", context);
     }
 
-    // Consolidated knowledge — compressed summaries from older conversations
     if (consolidated) {
       const tail = truncateAtEntryBoundary(consolidated, MAX_CONSOLIDATED_LINES);
       parts.push("", "### Consolidated Knowledge (older conversations)", tail);
     }
 
-    // Reflections — lessons learned from past interactions
     if (reflections) {
       const tail = truncateAtEntryBoundary(reflections, 60);
       parts.push("", "### Reflections (REFLECTIONS.md)", tail);
     }
 
     if (todayLog) {
-      // Truncate at entry boundaries (---) instead of splitting mid-entry
       const tail = truncateAtEntryBoundary(todayLog, MAX_LOG_LINES);
       parts.push("", "### Today's Conversation Log", tail);
     }
@@ -521,24 +644,6 @@ export class MemoryManager {
 // ---------------------------------------------------------------------------
 
 /**
- * Sanitize a user/thread ID for safe use as a directory name.
- * Uses a hash suffix when characters are replaced to reduce collision risk.
- */
-function sanitizeId(id: string): string {
-  const safe = id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 128);
-  // If sanitization changed the string, append a short hash to reduce collisions
-  if (safe !== id) {
-    let hash = 0;
-    for (let i = 0; i < id.length; i++) {
-      hash = ((hash << 5) - hash + id.charCodeAt(i)) | 0;
-    }
-    const suffix = Math.abs(hash).toString(36).slice(0, 6);
-    return `${safe.slice(0, 121)}_${suffix}`;
-  }
-  return safe;
-}
-
-/**
  * Truncate a log to approximately `maxLines` lines, but always cut at an
  * entry boundary (the "---" separator) to avoid splitting a conversation
  * entry in half.
@@ -547,7 +652,6 @@ function truncateAtEntryBoundary(log: string, maxLines: number): string {
   const lines = log.split("\n");
   if (lines.length <= maxLines) return log;
 
-  // Walk backwards from the cut point to find the nearest entry separator
   const cutStart = lines.length - maxLines;
   let adjustedStart = cutStart;
   for (let i = cutStart; i < lines.length; i++) {

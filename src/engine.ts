@@ -50,7 +50,7 @@ import {
 } from "./schema.js";
 import { loadConfig, saveConfig, SPORTS_SKILLS_DISCLAIMER } from "./config.js";
 import type { CLIConfig } from "./config.js";
-import { MemoryManager } from "./memory.js";
+import { MemoryManager, PodMemoryStorage } from "./memory.js";
 import { routePromptToSkills, routeToAgents } from "./router.js";
 import { loadAgents, type AgentDef } from "./agents.js";
 import { McpManager } from "./mcp.js";
@@ -3218,7 +3218,11 @@ export class sportsclawEngine {
 
     let strategyContent = "";
     if (options?.userId) {
-      memory = new MemoryManager(options.userId);
+      const machinaServer = this.mcpManager.getMachinaServerName();
+      const podStorage = machinaServer
+        ? new PodMemoryStorage(this.mcpManager, machinaServer)
+        : undefined;
+      memory = new MemoryManager(options.userId, podStorage);
       options?.onProgress?.({ type: "phase", label: "Loading memory" });
       [memoryBlock, strategyContent] = await Promise.all([
         memory.buildMemoryBlock(),

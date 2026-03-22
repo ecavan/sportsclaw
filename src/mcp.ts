@@ -653,6 +653,32 @@ export class McpManager {
     }
   }
 
+  /**
+   * Call a tool by server name and raw tool name (no mcp__ prefix).
+   * Convenience wrapper used by PodMemoryStorage.
+   */
+  async callToolDirect(
+    serverName: string,
+    toolName: string,
+    args: Record<string, unknown>
+  ): Promise<{ content: string; isError: boolean; errorCode?: McpErrorCode }> {
+    return this.callTool(`mcp__${serverName}__${toolName}`, args);
+  }
+
+  /**
+   * Find the first connected Machina MCP server (has document CRUD tools).
+   * Returns undefined if no Machina pod is connected.
+   */
+  getMachinaServerName(): string | undefined {
+    for (const [serverName] of this.connections) {
+      const has = (tool: string) => this.routeMap.has(`mcp__${serverName}__${tool}`);
+      if (has("search_documents") && has("create_document") && has("update_document")) {
+        return serverName;
+      }
+    }
+    return undefined;
+  }
+
   /** Disconnect all MCP clients */
   async disconnectAll(): Promise<void> {
     for (const [name, conn] of this.connections) {
