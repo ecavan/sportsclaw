@@ -575,16 +575,42 @@ export class McpManager {
           errorCode: "circuit_open",
         };
       }
-      // Cooldown expired — allow one probe call
-      connection.failures = 0;
+      // Cooldown expired — half-open: reconnect before probe call
+      if (this.verbose) {
+        console.error(`[sportsclaw] mcp: "${route.serverName}" circuit half-open, attempting reconnect`);
+      }
+      try {
+        try { await connection.client.close(); } catch { /* stale connection, ignore */ }
+        const cfg = this.configs[route.serverName];
+        if (cfg) await this.connectOne(route.serverName, cfg);
+        connection.failures = 0;
+      } catch {
+        // Reconnect failed — stay open, reset cooldown
+        connection.lastFailureAt = Date.now();
+        return {
+          content: JSON.stringify({
+            error: `MCP server "${route.serverName}" reconnection failed after circuit breaker cooldown`,
+            error_code: "connection_failed",
+            hint: "The server may still be down. Will retry after another cooldown period.",
+          }),
+          isError: true,
+          errorCode: "connection_failed",
+        };
+      }
     }
 
     const serverConfig = this.configs[route.serverName];
     const timeoutMs = serverConfig?.timeoutMs ?? McpManager.DEFAULT_CALL_TIMEOUT_MS;
 
+    // Inject user context into tool args for per-user scoping
+    const enrichedArgs = {
+      ...args,
+      ...(!args?._context && this.userId ? { _context: { user_id: this.userId } } : {}),
+    };
+
     try {
       const result = await Promise.race([
-        connection.client.callTool({ name: route.toolName, arguments: args }),
+        connection.client.callTool({ name: route.toolName, arguments: enrichedArgs }),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("MCP_TIMEOUT")), timeoutMs)
         ),
