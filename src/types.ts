@@ -313,6 +313,8 @@ export interface RunOptions {
   abortSignal?: AbortSignal;
   /** Image attachments from the user (vision input). */
   images?: ImageAttachment[];
+  /** Additional system prompt injected by the caller (e.g. relay user context). */
+  systemPrompt?: string;
   /** @deprecated Use onProgress instead */
   onSpinnerUpdate?: (msg: string) => void;
 }

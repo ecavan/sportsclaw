@@ -502,7 +502,7 @@ export class sportsclawEngine {
   }
 
   /** Full system prompt (base + dynamic tool info + strategy + agent directives + user-supplied) */
-  private buildSystemPrompt(hasMemory: boolean, agents?: AgentDef[], strategyContent?: string): string {
+  private buildSystemPrompt(hasMemory: boolean, agents?: AgentDef[], strategyContent?: string, callerSystemPrompt?: string): string {
     let basePrompt = BASE_SYSTEM_PROMPT;
 
     // Strip fan profile update directive when skipFanProfile is active
@@ -770,6 +770,10 @@ export class sportsclawEngine {
         }
         parts.push(guide.body);
       }
+    }
+
+    if (callerSystemPrompt) {
+      parts.unshift(callerSystemPrompt);
     }
 
     if (this.config.systemPrompt) {
@@ -3396,7 +3400,7 @@ export class sportsclawEngine {
 
         return generateText({
           model: this.mainModel,
-          system: this.buildSystemPrompt(!!memory, [agent], strategyContent),
+          system: this.buildSystemPrompt(!!memory, [agent], strategyContent, options?.systemPrompt),
           messages: this.messages,
           tools,
           ...(agentActiveTools ? { activeTools: agentActiveTools } : {}),
@@ -3513,7 +3517,7 @@ export class sportsclawEngine {
     const callLLM = (messagesOverride?: Message[]) =>
       generateText({
         model: this.mainModel,
-        system: this.buildSystemPrompt(!!memory, activeAgents.length > 0 ? activeAgents : undefined, strategyContent),
+        system: this.buildSystemPrompt(!!memory, activeAgents.length > 0 ? activeAgents : undefined, strategyContent, options?.systemPrompt),
         messages: messagesOverride ?? this.messages,
         tools,
         ...(activeTools ? { activeTools } : {}),

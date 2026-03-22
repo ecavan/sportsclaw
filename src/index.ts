@@ -1538,6 +1538,14 @@ async function cmdQuery(args: string[]): Promise<void> {
     args.splice(userIdx, 2); // remove --user and its value from args
   }
 
+  // Parse --system-prompt <text> flag (used by relay to inject caller context)
+  let systemPrompt: string | undefined;
+  const systemPromptIdx = args.indexOf("--system-prompt");
+  if (systemPromptIdx >= 0 && systemPromptIdx + 1 < args.length) {
+    systemPrompt = args[systemPromptIdx + 1];
+    args.splice(systemPromptIdx, 2);
+  }
+
   const filteredArgs = args.filter((a) => a !== "--verbose" && a !== "-v" && a !== "--pipe" && !a.startsWith("--format="));
   const prompt = filteredArgs.join(" ");
 
@@ -1583,6 +1591,7 @@ async function cmdQuery(args: string[]): Promise<void> {
     try {
       const result = await engine.run(prompt, {
         userId,
+        systemPrompt,
         onProgress: (event) => emitNdjson({ ...event, category: "progress" }),
       });
       const formatted = formatResponse(result, formatArg as any);
@@ -1596,7 +1605,7 @@ async function cmdQuery(args: string[]): Promise<void> {
   } else if (verbose) {
     // Verbose mode: no spinner, raw console.error logs
     try {
-      const result = await engine.run(prompt);
+      const result = await engine.run(prompt, { systemPrompt });
       console.log(renderMarkdown(result));
       await saveGeneratedImages(engine);
       await saveGeneratedVideos(engine);
@@ -1621,6 +1630,7 @@ async function cmdQuery(args: string[]): Promise<void> {
     tracker.start();
     try {
       const result = await engine.run(prompt, {
+        systemPrompt,
         onProgress: tracker.handler,
         abortSignal: cancel.abortSignal,
       });

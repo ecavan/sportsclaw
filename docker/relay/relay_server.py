@@ -305,6 +305,10 @@ def _build_cmd(body: dict) -> list[str]:
     if user_id:
         cmd.extend(["--user", user_id])
 
+    system_prompt = body.get("system_prompt")
+    if system_prompt:
+        cmd.extend(["--system-prompt", system_prompt])
+
     if body.get("verbose"):
         cmd.append("--verbose")
 
