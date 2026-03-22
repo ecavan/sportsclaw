@@ -1182,7 +1182,17 @@ function promptWithSlashIntercept(
     };
 
     rl.question(promptText).then((raw: string) => {
+      // Snapshot history BEFORE closing readline (close clears internal state)
+      const updatedHistory = (rl as unknown as { history: string[] }).history
+        ? [...(rl as unknown as { history: string[] }).history]
+        : [...history, ...(raw.trim() ? [raw] : [])];
+
+      // Close readline FIRST — while stdin is still piped through the
+      // transform — so its close-down doesn't re-echo the line on a
+      // bare stdout.  Then detach the pipe.
+      rl.close();
       cleanup();
+
       // Clear any leftover hint line
       if (hintShown) {
         process.stdout.write(`\x1B[1B\x1B[2K\x1B[1A`);
@@ -1190,15 +1200,10 @@ function promptWithSlashIntercept(
       // Restore real newlines from the paste placeholder
       const value = raw.replaceAll(PASTE_NL, "\n");
 
-      // Snapshot history from the readline instance
-      const updatedHistory = (rl as unknown as { history: string[] }).history
-        ? [...(rl as unknown as { history: string[] }).history]
-        : [...history, ...(value.trim() ? [value] : [])];
-      rl.close();
       resolve({ type: "input", value, history: updatedHistory });
     }).catch(() => {
-      cleanup();
       rl.close();
+      cleanup();
       resolve(null);
     });
   });

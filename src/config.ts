@@ -22,6 +22,7 @@ import {
   saveSchema,
   listSchemas,
 } from "./schema.js";
+import { loadMcpConfigs, saveMcpConfigs, removeMcpConfig } from "./mcp.js";
 import {
   checkPythonVersion,
   findBestPython,
@@ -390,306 +391,137 @@ export function applyConfigToEnv(): ResolvedConfig {
 
 export async function runConfigFlow(): Promise<CLIConfig> {
   console.log(pc.bold(pc.blue(ASCII_LOGO)));
-  p.intro("🦞 sportsclaw Configuration");
+  p.intro("sportsclaw Configuration");
 
   const savedConfig = loadConfig();
+  const isFirstRun = !savedConfig.provider;
 
-  function hasApiKey(prov: LLMProvider): boolean {
-    if (process.env[PROVIDER_ENV[prov]]) return true;
-    if (savedConfig.provider === prov && savedConfig.apiKey) return true;
-    return false;
-  }
+  // -----------------------------------------------------------------------
+  // Returning user — show summary and let them pick what to change
+  // -----------------------------------------------------------------------
+  if (!isFirstRun) {
+    const existingSchemas = listSchemas();
+    const mcpConfigs = loadMcpConfigs();
+    const mcpCount = Object.keys(mcpConfigs).length;
+    const discord = savedConfig.chatIntegrations?.discord;
+    const telegram = savedConfig.chatIntegrations?.telegram;
 
-  const provider = await p.select({
-    message: "⚡ Which LLM provider would you like to use?",
-    options: [
-      { value: "anthropic", label: "Anthropic", hint: hasApiKey("anthropic") ? "Claude · authenticated" : "Claude" },
-      { value: "openai", label: "OpenAI", hint: hasApiKey("openai") ? "GPT · authenticated" : "GPT" },
-      { value: "google", label: "Google", hint: hasApiKey("google") ? "Gemini · authenticated" : "Gemini" },
-    ],
-  });
+    console.log("");
+    console.log(pc.bold("  Current Configuration"));
+    console.log("");
+    console.log(`  ${pc.dim("Provider")}     ${savedConfig.provider}${savedConfig.model ? ` (${savedConfig.model})` : ""}`);
+    console.log(`  ${pc.dim("API Key")}      ${savedConfig.apiKey ? pc.green("configured") : pc.yellow("missing")}`);
+    console.log(`  ${pc.dim("Python")}       ${savedConfig.pythonPath || "python3"}`);
+    console.log(`  ${pc.dim("Sports")}       ${existingSchemas.length > 0 ? existingSchemas.join(", ") : pc.yellow("none installed")}`);
+    console.log(`  ${pc.dim("Machina MCP")}  ${mcpCount > 0 ? Object.keys(mcpConfigs).join(", ") : pc.dim("none")}`);
+    console.log(`  ${pc.dim("Discord")}      ${discord?.botToken ? pc.green("configured") : pc.dim("not set")}`);
+    console.log(`  ${pc.dim("Telegram")}     ${telegram?.botToken ? pc.green("configured") : pc.dim("not set")}`);
+    console.log("");
 
-  if (p.isCancel(provider)) {
-    p.cancel("🚫 Setup cancelled.");
-    process.exit(0);
-  }
-
-  const model = await p.select({
-    message: "🧠 Which model?",
-    options:
-      PROVIDER_MODEL_PROFILES[provider as LLMProvider]?.selectableModels ?? [],
-  });
-
-  if (p.isCancel(model)) {
-    p.cancel("🚫 Setup cancelled.");
-    process.exit(0);
-  }
-
-  const selectedProvider = provider as LLMProvider;
-  const envName = PROVIDER_ENV[selectedProvider];
-  const existingKey = process.env[PROVIDER_ENV[selectedProvider]]
-    || (savedConfig.provider === selectedProvider ? savedConfig.apiKey : undefined);
-
-  let finalApiKey: string;
-
-  if (existingKey && existingKey.trim().length > 0) {
-    p.log.info(`Using existing ${envName} (already configured).`);
-    finalApiKey = existingKey.trim();
-  } else {
-    const apiKey = await p.password({
-      message: `🔑 Paste your ${envName}:`,
-      validate: (val) => {
-        if (!val || val.trim().length === 0) return "API key is required.";
-      },
+    const sections = await p.multiselect({
+      message: "What would you like to reconfigure?",
+      options: [
+        { value: "provider", label: "LLM Provider & Model", hint: `currently ${savedConfig.provider}` },
+        { value: "python", label: "Python Path", hint: savedConfig.pythonPath || "python3" },
+        { value: "sports", label: "Installed Sports", hint: `${existingSchemas.length} installed` },
+        { value: "mcp", label: "Machina MCP", hint: `${mcpCount} configured` },
+        { value: "discord", label: "Discord Integration", hint: discord?.botToken ? "configured" : "not set" },
+        { value: "telegram", label: "Telegram Integration", hint: telegram?.botToken ? "configured" : "not set" },
+      ],
     });
 
-    if (p.isCancel(apiKey)) {
-      p.cancel("🚫 Setup cancelled.");
+    if (p.isCancel(sections)) {
+      p.cancel("No changes made.");
       process.exit(0);
     }
-    finalApiKey = (apiKey as string).trim();
-  }
 
-  // --- Smart Python prerequisite detection & guided install ---
-  let detectedPython = findBestPython();
+    const selected = new Set(sections as string[]);
+    let updatedConfig = { ...savedConfig };
 
-  if (detectedPython) {
-    p.log.success(
-      `Python ${detectedPython.version.version} detected at ${detectedPython.path}`
-    );
-  } else {
-    p.log.warn(
-      `Python ${MIN_PYTHON_VERSION.major}.${MIN_PYTHON_VERSION.minor}+ not detected on this system.`
-    );
-
-    const os = (await import("node:os")).platform();
-
-    if (os === "darwin") {
-      // macOS: check Homebrew first
-      const hb = detectHomebrew();
-      if (!hb.installed) {
-        const installHb = await p.confirm({
-          message:
-            "Homebrew is not installed. Install it now? (needed for Python)",
-          initialValue: true,
-        });
-        if (p.isCancel(installHb)) {
-          p.cancel("🚫 Setup cancelled.");
-          process.exit(0);
-        }
-        if (installHb) {
-          const s = p.spinner();
-          s.start("Installing Homebrew...");
-          const hbResult = installHomebrew();
-          if (hbResult.ok) {
-            s.stop("Homebrew installed.");
-          } else {
-            s.stop("Homebrew installation failed.");
-            p.log.error(hbResult.error ?? "Unknown error");
-            p.log.info(
-              'Install manually: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-            );
-          }
-        } else {
-          p.log.info(
-            'Install Homebrew manually: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-          );
-        }
-      }
-
-      // Check again after potential Homebrew install
-      detectedPython = findBestPython();
-      if (!detectedPython) {
-        const mgr = detectPlatformPackageManager();
-        if (mgr === "brew") {
-          const installPy = await p.confirm({
-            message:
-              "Python 3.10+ not found. Install Python 3.12 via Homebrew?",
-            initialValue: true,
-          });
-          if (p.isCancel(installPy)) {
-            p.cancel("🚫 Setup cancelled.");
-            process.exit(0);
-          }
-          if (installPy) {
-            const s = p.spinner();
-            s.start("Installing Python 3.12 via Homebrew...");
-            const pyResult = installPythonViaPackageManager("brew");
-            if (pyResult.ok) {
-              s.stop("Python installed via Homebrew.");
-            } else {
-              s.stop("Python installation failed.");
-              p.log.error(pyResult.error ?? "Unknown error");
-              p.log.info("Install manually: brew install python@3.12");
-            }
-          } else {
-            p.log.info("Install manually: brew install python@3.12");
-          }
-        } else {
-          p.log.info(
-            "Install Python 3.10+ manually (e.g. brew install python@3.12) and re-run config."
-          );
-        }
-      }
-    } else {
-      // Linux: detect package manager and offer install
-      const mgr = detectPlatformPackageManager();
-      if (mgr) {
-        const installPy = await p.confirm({
-          message: `Python 3.10+ not found. Install via ${mgr}?`,
-          initialValue: true,
-        });
-        if (p.isCancel(installPy)) {
-          p.cancel("🚫 Setup cancelled.");
-          process.exit(0);
-        }
-        if (installPy) {
-          const s = p.spinner();
-          s.start(`Installing Python via ${mgr}...`);
-          const pyResult = installPythonViaPackageManager(mgr);
-          if (pyResult.ok) {
-            s.stop(`Python installed via ${mgr}.`);
-          } else {
-            s.stop("Python installation failed.");
-            p.log.error(pyResult.error ?? "Unknown error");
-          }
-        }
-      } else {
-        p.log.info(
-          "Install Python 3.10+ using your system package manager and re-run config."
-        );
-      }
+    // --- Provider & Model ---
+    if (selected.has("provider")) {
+      const result = await configureProvider(savedConfig);
+      updatedConfig = { ...updatedConfig, ...result };
     }
 
-    // Re-detect after install attempts
-    detectedPython = findBestPython();
-    if (detectedPython) {
-      p.log.success(
-        `Python ${detectedPython.version.version} installed at ${detectedPython.path}`
-      );
+    // --- Python ---
+    if (selected.has("python")) {
+      const result = await configurePython(savedConfig);
+      updatedConfig.pythonPath = result;
     }
-  }
 
-  const pythonDefault = detectedPython?.path
-    ?? (existsSync("/opt/homebrew/bin/python3") ? "/opt/homebrew/bin/python3" : "python3");
-
-  const pythonPath = await p.text({
-    message: "🐍 Path to Python interpreter:",
-    placeholder: "python3",
-    defaultValue: pythonDefault,
-  });
-
-  if (p.isCancel(pythonPath)) {
-    p.cancel("🚫 Setup cancelled.");
-    process.exit(0);
-  }
-
-  // Validate the chosen Python version
-  const pyCheck = checkPythonVersion((pythonPath as string) || "python3");
-  if (pyCheck.ok) {
-    p.log.success(`Python ${pyCheck.version} OK`);
-  } else if (pyCheck.version) {
-    p.log.error(
-      `Python ${pyCheck.version} is too old. v${MIN_PYTHON_VERSION.major}.${MIN_PYTHON_VERSION.minor}+ is required.`
-    );
-    p.log.info("Install a newer Python and re-run: sportsclaw config");
-    process.exit(1);
-  } else {
-    p.log.warn(
-      `Could not verify Python version at "${(pythonPath as string) || "python3"}". Proceeding anyway.`
-    );
-  }
-
-  // --- Sport selection (skip if schemas already installed) ---
-  const existingSchemas = listSchemas();
-  let sportSelections: string[] | undefined;
-
-  if (existingSchemas.length > 0) {
-    p.log.info(`${existingSchemas.length} sport schema(s) already installed: ${existingSchemas.join(", ")}`);
-    const reconfigure = await p.confirm({
-      message: "Reconfigure installed sports?",
-      initialValue: false,
-    });
-    if (p.isCancel(reconfigure)) {
-      p.cancel("🚫 Setup cancelled.");
-      process.exit(0);
-    }
-    if (reconfigure) {
+    // --- Sports ---
+    if (selected.has("sports")) {
       p.log.warn(SPORTS_SKILLS_DISCLAIMER);
       const selections = await promptSportSelection();
-      if (p.isCancel(selections)) {
-        p.cancel("🚫 Setup cancelled.");
-        process.exit(0);
+      if (!p.isCancel(selections)) {
+        updatedConfig.selectedSports = selections as string[];
       }
-      sportSelections = selections as string[];
     }
-  } else {
-    p.log.warn(SPORTS_SKILLS_DISCLAIMER);
-    const selections = await promptSportSelection();
-    if (p.isCancel(selections)) {
-      p.cancel("🚫 Setup cancelled.");
-      process.exit(0);
+
+    // --- MCP Pods ---
+    if (selected.has("mcp")) {
+      await configureMcpInteractive();
     }
-    sportSelections = selections as string[];
+
+    // --- Discord ---
+    if (selected.has("discord")) {
+      const result = await configureDiscordIntegration(savedConfig);
+      if (result) {
+        updatedConfig.chatIntegrations = {
+          ...updatedConfig.chatIntegrations,
+          discord: result,
+        };
+      }
+    }
+
+    // --- Telegram ---
+    if (selected.has("telegram")) {
+      const result = await configureTelegramIntegration(savedConfig);
+      if (result) {
+        updatedConfig.chatIntegrations = {
+          ...updatedConfig.chatIntegrations,
+          telegram: result,
+        };
+      }
+    }
+
+    saveConfig(updatedConfig);
+    p.outro(`Config saved to ${CONFIG_PATH}`);
+
+    // Install sport schemas if changed
+    if (selected.has("sports") && updatedConfig.selectedSports) {
+      const resolvedPython = updatedConfig.pythonPath || "python3";
+      await installSelectedSports(updatedConfig.selectedSports, resolvedPython);
+    }
+
+    return updatedConfig;
   }
 
-  // --- Optional Discord bot integration ---
-  let discordConfig: DiscordIntegrationConfig | undefined;
+  // -----------------------------------------------------------------------
+  // First-time setup — full linear wizard
+  // -----------------------------------------------------------------------
+  const { provider: selectedProvider, model: selectedModel, apiKey: finalApiKey } =
+    await configureProvider(savedConfig);
+  const pythonPath = await configurePython(savedConfig);
 
-  const configureDiscord = await p.confirm({
-    message: "🤖 Configure Discord bot integration? (optional)",
+  // --- Sport selection ---
+  p.log.warn(SPORTS_SKILLS_DISCLAIMER);
+  const sportSelectionsRaw = await promptSportSelection();
+  if (p.isCancel(sportSelectionsRaw)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+  const sportSelections = sportSelectionsRaw as string[];
+
+  // --- Optional Discord bot integration ---
+  const configureDiscordPrompt = await p.confirm({
+    message: "Configure Discord bot integration? (optional)",
     initialValue: false,
   });
-
-  if (!p.isCancel(configureDiscord) && configureDiscord) {
-    const existingDiscordToken = savedConfig.chatIntegrations?.discord?.botToken;
-
-    let discordToken: string;
-    if (existingDiscordToken && existingDiscordToken.trim().length > 0) {
-      p.log.info("Using existing Discord bot token (already configured).");
-      discordToken = existingDiscordToken.trim();
-    } else {
-      const tokenInput = await p.password({
-        message: "🔑 Paste your Discord bot token:",
-        validate: (val) => {
-          if (!val || val.trim().length === 0) return "Bot token is required.";
-        },
-      });
-      if (p.isCancel(tokenInput)) {
-        p.cancel("🚫 Setup cancelled.");
-        process.exit(0);
-      }
-      discordToken = (tokenInput as string).trim();
-    }
-
-    const existingAllowed = savedConfig.chatIntegrations?.discord?.allowedUsers;
-    const allowedUsersInput = await p.text({
-      message: "👥 Allowed Discord user IDs (comma-separated, or blank to let anyone chat):",
-      placeholder: "Leave blank for public access",
-      defaultValue: existingAllowed?.join(",") ?? "",
-    });
-    if (p.isCancel(allowedUsersInput)) {
-      p.cancel("🚫 Setup cancelled.");
-      process.exit(0);
-    }
-    const allowedUsers = parseCommaList(allowedUsersInput as string);
-
-    const existingPrefix = savedConfig.chatIntegrations?.discord?.prefix;
-    const prefixInput = await p.text({
-      message: "💬 Command prefix:",
-      placeholder: "!sportsclaw",
-      defaultValue: existingPrefix || "!sportsclaw",
-    });
-    if (p.isCancel(prefixInput)) {
-      p.cancel("🚫 Setup cancelled.");
-      process.exit(0);
-    }
-
-    discordConfig = {
-      botToken: discordToken,
-      ...(allowedUsers.length > 0 && { allowedUsers }),
-      prefix: (prefixInput as string) || "!sportsclaw",
-    };
+  let discordConfig: DiscordIntegrationConfig | undefined;
+  if (!p.isCancel(configureDiscordPrompt) && configureDiscordPrompt) {
+    discordConfig = await configureDiscordIntegration(savedConfig) ?? undefined;
   }
 
   // Preserve existing Telegram config when saving from the main config flow
@@ -702,18 +534,18 @@ export async function runConfigFlow(): Promise<CLIConfig> {
 
   const config: CLIConfig = {
     provider: selectedProvider,
-    model: model as string,
+    model: selectedModel,
     apiKey: finalApiKey,
-    pythonPath: (pythonPath as string) || "python3",
-    ...(sportSelections && { selectedSports: sportSelections }),
+    pythonPath: pythonPath || "python3",
+    selectedSports: sportSelections,
     ...(Object.keys(chatIntegrations).length > 0 && { chatIntegrations }),
   };
 
   saveConfig(config);
-  p.outro(`✅ Config saved to ${CONFIG_PATH}`);
+  p.outro(`Config saved to ${CONFIG_PATH}`);
 
-  // Install selected sport schemas (only if user made a new selection)
-  if (sportSelections) {
+  // Install selected sport schemas
+  if (sportSelections.length > 0) {
     const resolvedPython = config.pythonPath || "python3";
     await installSelectedSports(sportSelections, resolvedPython);
   }
@@ -903,6 +735,323 @@ export async function runChannelsFlow(): Promise<void> {
 
 // ---------------------------------------------------------------------------
 // Sport multi-select prompt (reusable)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Extracted config section helpers (used by both first-run and reconfigure)
+// ---------------------------------------------------------------------------
+
+function hasApiKey(savedConfig: CLIConfig, prov: LLMProvider): boolean {
+  if (process.env[PROVIDER_ENV[prov]]) return true;
+  if (savedConfig.provider === prov && savedConfig.apiKey) return true;
+  return false;
+}
+
+async function configureProvider(savedConfig: CLIConfig): Promise<{
+  provider: LLMProvider;
+  model: string;
+  apiKey: string;
+}> {
+  const provider = await p.select({
+    message: "Which LLM provider?",
+    options: [
+      { value: "anthropic", label: "Anthropic", hint: hasApiKey(savedConfig, "anthropic") ? "Claude · authenticated" : "Claude" },
+      { value: "openai", label: "OpenAI", hint: hasApiKey(savedConfig, "openai") ? "GPT · authenticated" : "GPT" },
+      { value: "google", label: "Google", hint: hasApiKey(savedConfig, "google") ? "Gemini · authenticated" : "Gemini" },
+    ],
+    initialValue: savedConfig.provider || undefined,
+  });
+
+  if (p.isCancel(provider)) {
+    p.cancel("Cancelled.");
+    process.exit(0);
+  }
+
+  const model = await p.select({
+    message: "Which model?",
+    options: PROVIDER_MODEL_PROFILES[provider as LLMProvider]?.selectableModels ?? [],
+    initialValue: savedConfig.model || undefined,
+  });
+
+  if (p.isCancel(model)) {
+    p.cancel("Cancelled.");
+    process.exit(0);
+  }
+
+  const selectedProvider = provider as LLMProvider;
+  const envName = PROVIDER_ENV[selectedProvider];
+  const existingKey = process.env[PROVIDER_ENV[selectedProvider]]
+    || (savedConfig.provider === selectedProvider ? savedConfig.apiKey : undefined);
+
+  let apiKey: string;
+  if (existingKey && existingKey.trim().length > 0) {
+    const keepExisting = await p.confirm({
+      message: `${envName} is already set. Keep it?`,
+      initialValue: true,
+    });
+    if (p.isCancel(keepExisting)) { p.cancel("Cancelled."); process.exit(0); }
+    if (keepExisting) {
+      apiKey = existingKey.trim();
+    } else {
+      const newKey = await p.password({
+        message: `Paste your ${envName}:`,
+        validate: (val) => { if (!val || !val.trim()) return "API key is required."; },
+      });
+      if (p.isCancel(newKey)) { p.cancel("Cancelled."); process.exit(0); }
+      apiKey = (newKey as string).trim();
+    }
+  } else {
+    const newKey = await p.password({
+      message: `Paste your ${envName}:`,
+      validate: (val) => { if (!val || !val.trim()) return "API key is required."; },
+    });
+    if (p.isCancel(newKey)) { p.cancel("Cancelled."); process.exit(0); }
+    apiKey = (newKey as string).trim();
+  }
+
+  return { provider: selectedProvider, model: model as string, apiKey };
+}
+
+async function configurePython(_savedConfig: CLIConfig): Promise<string> {
+  let detectedPython = findBestPython();
+
+  if (detectedPython) {
+    p.log.success(`Python ${detectedPython.version.version} detected at ${detectedPython.path}`);
+  } else {
+    p.log.warn(`Python ${MIN_PYTHON_VERSION.major}.${MIN_PYTHON_VERSION.minor}+ not detected.`);
+
+    const os = (await import("node:os")).platform();
+    const mgr = detectPlatformPackageManager();
+
+    if (os === "darwin" && !detectHomebrew().installed) {
+      const installHb = await p.confirm({
+        message: "Homebrew is not installed. Install it now?",
+        initialValue: true,
+      });
+      if (!p.isCancel(installHb) && installHb) {
+        const s = p.spinner();
+        s.start("Installing Homebrew...");
+        const hbResult = installHomebrew();
+        s.stop(hbResult.ok ? "Homebrew installed." : "Homebrew installation failed.");
+      }
+    }
+
+    detectedPython = findBestPython();
+    if (!detectedPython && mgr) {
+      const installPy = await p.confirm({
+        message: `Python 3.10+ not found. Install via ${mgr}?`,
+        initialValue: true,
+      });
+      if (!p.isCancel(installPy) && installPy) {
+        const s = p.spinner();
+        s.start(`Installing Python via ${mgr}...`);
+        const pyResult = installPythonViaPackageManager(mgr);
+        s.stop(pyResult.ok ? `Python installed via ${mgr}.` : "Python installation failed.");
+      }
+    }
+
+    detectedPython = findBestPython();
+    if (detectedPython) {
+      p.log.success(`Python ${detectedPython.version.version} installed at ${detectedPython.path}`);
+    }
+  }
+
+  const pythonDefault = detectedPython?.path
+    ?? (existsSync("/opt/homebrew/bin/python3") ? "/opt/homebrew/bin/python3" : "python3");
+
+  const pythonPath = await p.text({
+    message: "Path to Python interpreter:",
+    placeholder: "python3",
+    defaultValue: pythonDefault,
+  });
+
+  if (p.isCancel(pythonPath)) { p.cancel("Cancelled."); process.exit(0); }
+
+  const pyCheck = checkPythonVersion((pythonPath as string) || "python3");
+  if (pyCheck.ok) {
+    p.log.success(`Python ${pyCheck.version} OK`);
+  } else if (pyCheck.version) {
+    p.log.error(`Python ${pyCheck.version} is too old. v${MIN_PYTHON_VERSION.major}.${MIN_PYTHON_VERSION.minor}+ required.`);
+    p.log.info("Install a newer Python and re-run: sportsclaw config");
+    process.exit(1);
+  } else {
+    p.log.warn(`Could not verify Python at "${(pythonPath as string) || "python3"}". Proceeding anyway.`);
+  }
+
+  return (pythonPath as string) || "python3";
+}
+
+async function configureDiscordIntegration(savedConfig: CLIConfig): Promise<DiscordIntegrationConfig | null> {
+  const existingToken = savedConfig.chatIntegrations?.discord?.botToken;
+
+  let token: string;
+  if (existingToken && existingToken.trim().length > 0) {
+    const keep = await p.confirm({ message: "Discord bot token already set. Keep it?", initialValue: true });
+    if (p.isCancel(keep)) return null;
+    if (keep) {
+      token = existingToken.trim();
+    } else {
+      const input = await p.password({
+        message: "Paste your Discord bot token:",
+        validate: (val) => { if (!val?.trim()) return "Bot token is required."; },
+      });
+      if (p.isCancel(input)) return null;
+      token = (input as string).trim();
+    }
+  } else {
+    const input = await p.password({
+      message: "Paste your Discord bot token:",
+      validate: (val) => { if (!val?.trim()) return "Bot token is required."; },
+    });
+    if (p.isCancel(input)) return null;
+    token = (input as string).trim();
+  }
+
+  const existingAllowed = savedConfig.chatIntegrations?.discord?.allowedUsers;
+  const allowedInput = await p.text({
+    message: "Allowed Discord user IDs (comma-separated, or blank for public):",
+    defaultValue: existingAllowed?.join(",") ?? "",
+  });
+  if (p.isCancel(allowedInput)) return null;
+  const allowedUsers = parseCommaList(allowedInput as string);
+
+  const existingPrefix = savedConfig.chatIntegrations?.discord?.prefix;
+  const prefixInput = await p.text({
+    message: "Command prefix:",
+    defaultValue: existingPrefix || "!sportsclaw",
+  });
+  if (p.isCancel(prefixInput)) return null;
+
+  return {
+    botToken: token,
+    ...(allowedUsers.length > 0 && { allowedUsers }),
+    prefix: (prefixInput as string) || "!sportsclaw",
+  };
+}
+
+async function configureTelegramIntegration(savedConfig: CLIConfig): Promise<TelegramIntegrationConfig | null> {
+  const existingToken = savedConfig.chatIntegrations?.telegram?.botToken;
+
+  let token: string;
+  if (existingToken && existingToken.trim().length > 0) {
+    const keep = await p.confirm({ message: "Telegram bot token already set. Keep it?", initialValue: true });
+    if (p.isCancel(keep)) return null;
+    if (keep) {
+      token = existingToken.trim();
+    } else {
+      const input = await p.password({
+        message: "Paste your Telegram bot token:",
+        validate: (val) => { if (!val?.trim()) return "Bot token is required."; },
+      });
+      if (p.isCancel(input)) return null;
+      token = (input as string).trim();
+    }
+  } else {
+    const input = await p.password({
+      message: "Paste your Telegram bot token:",
+      validate: (val) => { if (!val?.trim()) return "Bot token is required."; },
+    });
+    if (p.isCancel(input)) return null;
+    token = (input as string).trim();
+  }
+
+  const existingAllowed = savedConfig.chatIntegrations?.telegram?.allowedUsers;
+  const allowedInput = await p.text({
+    message: "Allowed Telegram user IDs (comma-separated, or blank for public):",
+    defaultValue: existingAllowed?.join(",") ?? "",
+  });
+  if (p.isCancel(allowedInput)) return null;
+  const allowedUsers = parseCommaList(allowedInput as string);
+
+  return {
+    botToken: token,
+    ...(allowedUsers.length > 0 && { allowedUsers }),
+  };
+}
+
+async function configureMcpInteractive(): Promise<void> {
+  const configs = loadMcpConfigs();
+  const names = Object.keys(configs);
+
+  if (names.length > 0) {
+    console.log("");
+    console.log(pc.bold(`  Machina MCP (${names.length})`));
+    for (const [name, config] of Object.entries(configs)) {
+      const desc = config.description ? pc.dim(` — ${config.description}`) : "";
+      console.log(`    ${pc.cyan(name)} ${pc.dim(config.url)}${desc}`);
+    }
+    console.log("");
+  }
+
+  const action = await p.select({
+    message: "Machina MCP action:",
+    options: [
+      { value: "add", label: "Add a new MCP server" },
+      ...(names.length > 0 ? [{ value: "remove", label: "Remove an MCP server" }] : []),
+      { value: "done", label: "Done" },
+    ],
+  });
+
+  if (p.isCancel(action) || action === "done") return;
+
+  if (action === "add") {
+    const url = await p.text({
+      message: "MCP server URL:",
+      placeholder: "https://your-pod.machina.gg/mcp/sse",
+      validate: (val) => { if (!val?.trim()) return "URL is required."; },
+    });
+    if (p.isCancel(url)) return;
+
+    const name = await p.text({
+      message: "Server name:",
+      placeholder: "my-pod",
+      validate: (val) => {
+        if (!val?.trim()) return "Name is required.";
+        if (!/^[a-zA-Z0-9_-]+$/.test(val.trim())) return "Only alphanumeric, hyphens, underscores.";
+      },
+    });
+    if (p.isCancel(name)) return;
+
+    const token = await p.password({ message: "API token (or leave blank):" });
+    if (p.isCancel(token)) return;
+
+    const desc = await p.text({
+      message: "Description (optional):",
+      placeholder: "What this pod does",
+      defaultValue: "",
+    });
+    if (p.isCancel(desc)) return;
+
+    const updated = loadMcpConfigs();
+    updated[(name as string).trim()] = {
+      url: (url as string).trim(),
+      ...(desc && (desc as string).trim() ? { description: (desc as string).trim() } : {}),
+    };
+    saveMcpConfigs(updated);
+
+    // Save token to .env if provided
+    if (token && (token as string).trim()) {
+      const envKey = `SPORTSCLAW_MCP_TOKEN_${(name as string).trim().replace(/-/g, "_").toUpperCase()}`;
+      const envPath = join(homedir(), ".sportsclaw", ".env");
+      writeEnvVar(envPath, envKey, (token as string).trim());
+      p.log.info(`Token saved as ${envKey}`);
+    }
+
+    p.log.success(`Added Machina MCP server "${(name as string).trim()}"`);
+  } else if (action === "remove") {
+    const toRemove = await p.select({
+      message: "Which pod to remove?",
+      options: names.map((n) => ({ value: n, label: n, hint: configs[n].url })),
+    });
+    if (p.isCancel(toRemove)) return;
+
+    removeMcpConfig(toRemove as string);
+    p.log.success(`Removed Machina MCP server "${toRemove}"`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sport selection UI
 // ---------------------------------------------------------------------------
 
 function desc(sport: string): string {
