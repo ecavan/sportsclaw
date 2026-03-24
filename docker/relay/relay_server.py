@@ -146,6 +146,7 @@ async def query_stream(request: web.Request) -> web.StreamResponse:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            limit=16 * 1024 * 1024,  # 16MB line buffer (base64 images ~88KB, videos can be several MB)
         )
 
         async def stream_stdout():
@@ -222,6 +223,7 @@ async def query_sync(request: web.Request) -> web.Response:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            limit=16 * 1024 * 1024,  # 16MB line buffer (base64 images ~88KB, videos can be several MB)
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
