@@ -221,11 +221,13 @@ export class PodMemoryStorage implements MemoryStorage {
     try {
       const result = await this.callPod("search_documents", {
         filters: { name: this.docName(userId, file) },
-        fields: ["_id", "content"],
+        fields: ["_id", "content", "text"],
         page_size: 1,
       });
 
-      return result?.data?.[0]?.content?.text ?? "";
+      // Handle both nested (new) and flat (old) document layouts
+      const doc = result?.data?.[0];
+      return doc?.content?.text ?? doc?.text ?? "";
     } catch {
       return "";
     }
@@ -254,10 +256,10 @@ export class PodMemoryStorage implements MemoryStorage {
       if (existing?.data?.[0]) {
         await this.callPod("update_document", {
           item_id: existing.data[0]._id,
-          content: { text: content },
+          content: { content: { text: content } },
         });
       } else {
-        await this.callPod("create_document", { name, content: { text: content }, metadata });
+        await this.callPod("create_document", { name, content: { content: { text: content } }, metadata });
       }
     } catch {
       // Non-fatal: memory write failure shouldn't break the query
