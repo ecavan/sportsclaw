@@ -223,52 +223,65 @@ async def query_sync(request: web.Request) -> web.Response:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
-            limit=16 * 1024 * 1024,  # 16MB readline buffer (base64 images, videos)
         )
 
-        # Read stdout line-by-line (uses readline() which respects the 16MB
-        # limit — communicate() uses read() which ignores it and can silently
-        # truncate lines at the default 64KB StreamReader boundary).
+        # Use communicate() to read ALL stdout bytes at once (no line-length
+        # limit), then split by \n ourselves.  readline() enforces a 64KB
+        # default StreamReader limit that truncates large base64 lines;
+        # communicate() uses read() which has no such limit.
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+
+        stdout_text = stdout_bytes.decode() if stdout_bytes else ""
+        stderr_text = stderr_bytes.decode().strip() if stderr_bytes else ""
+
+        log(f"sync: stdout={len(stdout_bytes)} bytes, "
+            f"stderr={len(stderr_bytes)} bytes, "
+            f"exit={proc.returncode}")
+
+        # Parse NDJSON lines from engine output
         result_text = None
         error_text = None
         images = []
         videos = []
+        line_num = 0
         parse_failures = 0
 
-        async def parse_stdout():
-            nonlocal result_text, error_text, parse_failures
-            async for raw_line in proc.stdout:
-                decoded = raw_line.decode().rstrip("\n")
-                if not decoded:
-                    continue
-                try:
-                    event = json.loads(decoded)
-                    etype = event.get("type")
-                    if etype == "result":
-                        result_text = event.get("text", "")
-                    elif etype == "error":
-                        error_text = event.get("error", "Unknown error")
-                    elif etype == "image":
-                        images.append({
-                            "data": event.get("data", ""),
-                            "mimeType": event.get("mimeType", "image/png"),
-                            "prompt": event.get("prompt", ""),
-                        })
-                    elif etype == "video":
-                        videos.append({
-                            "data": event.get("data", ""),
-                            "mimeType": event.get("mimeType", "video/mp4"),
-                            "prompt": event.get("prompt", ""),
-                        })
-                except json.JSONDecodeError:
-                    parse_failures += 1
-                    log(f"sync: NDJSON parse failure #{parse_failures}, "
-                        f"line length={len(decoded)}")
-                    continue
-
-        await asyncio.wait_for(parse_stdout(), timeout=timeout)
-        await proc.wait()
-        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        for raw_line in stdout_text.split("\n"):
+            decoded = raw_line.strip()
+            if not decoded:
+                continue
+            line_num += 1
+            try:
+                event = json.loads(decoded)
+                etype = event.get("type")
+                if etype == "result":
+                    result_text = event.get("text", "")
+                elif etype == "error":
+                    error_text = event.get("error", "Unknown error")
+                elif etype == "image":
+                    images.append({
+                        "data": event.get("data", ""),
+                        "mimeType": event.get("mimeType", "image/png"),
+                        "prompt": event.get("prompt", ""),
+                    })
+                    log(f"sync: parsed image event, "
+                        f"data length={len(event.get('data', ''))}")
+                elif etype == "video":
+                    videos.append({
+                        "data": event.get("data", ""),
+                        "mimeType": event.get("mimeType", "video/mp4"),
+                        "prompt": event.get("prompt", ""),
+                    })
+                else:
+                    log(f"sync: line {line_num} type={etype}")
+            except json.JSONDecodeError as exc:
+                parse_failures += 1
+                log(f"sync: line {line_num} PARSE FAIL "
+                    f"len={len(decoded)} err={exc}")
+                continue
 
         if parse_failures:
             log(f"sync: {parse_failures} NDJSON line(s) failed to parse")
@@ -297,8 +310,7 @@ async def query_sync(request: web.Request) -> web.Response:
             return web.json_response(resp)
 
         # Fallback: no result event parsed
-        stderr_bytes = await proc.stderr.read() if proc.stderr else b""
-        stderr_text = stderr_bytes.decode().strip()
+        log(f"sync: no result event found in {line_num} lines")
         if proc.returncode == 0:
             return web.json_response({
                 "status": True,

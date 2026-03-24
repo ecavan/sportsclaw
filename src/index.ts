@@ -1602,6 +1602,16 @@ async function cmdQuery(args: string[]): Promise<void> {
         emitNdjson({ type: "video", data: vid.data, mimeType: vid.mimeType, prompt: vid.prompt });
       }
       emitNdjson({ type: "result", text: formatted.text });
+      // Wait for stdout to drain before exiting — process.stdout.write() to
+      // a pipe is async and process.exit() would truncate unflushed data
+      // (e.g. large base64 image lines that exceed the 64KB pipe buffer).
+      await new Promise<void>((resolve) => {
+        if (process.stdout.writableNeedDrain) {
+          process.stdout.once("drain", resolve);
+        } else {
+          resolve();
+        }
+      });
       process.exit(0);
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
