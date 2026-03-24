@@ -209,18 +209,18 @@ function parseMemoryFile(file: string): { memoryType: string; date?: string } {
 export class PodMemoryStorage implements MemoryStorage {
   constructor(private mcpManager: McpManager, private serverName: string) {}
 
+  /** Deterministic document name for a user's memory file. */
+  private docName(userId: string, file: string): string {
+    const { memoryType, date } = parseMemoryFile(file);
+    return date
+      ? `memory-${userId}-daily-${date}`
+      : `memory-${userId}-${memoryType}`;
+  }
+
   async read(userId: string, file: string): Promise<string> {
     try {
-      const { memoryType, date } = parseMemoryFile(file);
-      const filters: Record<string, unknown> = {
-        "metadata.type": "user-memory",
-        "metadata.user_id": userId,
-        "metadata.memory_type": memoryType,
-      };
-      if (date) filters["metadata.date"] = date;
-
       const result = await this.callPod("search_documents", {
-        filters,
+        filters: { name: this.docName(userId, file) },
         fields: ["_id", "content"],
         page_size: 1,
       });
@@ -234,9 +234,7 @@ export class PodMemoryStorage implements MemoryStorage {
   async write(userId: string, file: string, content: string): Promise<void> {
     try {
       const { memoryType, date } = parseMemoryFile(file);
-      const name = date
-        ? `memory-${userId}-daily-${date}`
-        : `memory-${userId}-${memoryType}`;
+      const name = this.docName(userId, file);
 
       const metadata: Record<string, unknown> = {
         type: "user-memory",
@@ -245,14 +243,10 @@ export class PodMemoryStorage implements MemoryStorage {
       };
       if (date) metadata.date = date;
 
-      // Upsert: search first, update if exists, create if not
+      // Upsert: search by deterministic name (not metadata) to avoid
+      // race-condition duplicates when concurrent processes write.
       const existing = await this.callPod("search_documents", {
-        filters: {
-          "metadata.type": "user-memory",
-          "metadata.user_id": userId,
-          "metadata.memory_type": memoryType,
-          ...(date ? { "metadata.date": date } : {}),
-        },
+        filters: { name },
         fields: ["_id"],
         page_size: 1,
       });
@@ -295,16 +289,8 @@ export class PodMemoryStorage implements MemoryStorage {
 
   async remove(userId: string, file: string): Promise<void> {
     try {
-      const { memoryType, date } = parseMemoryFile(file);
-      const filters: Record<string, unknown> = {
-        "metadata.type": "user-memory",
-        "metadata.user_id": userId,
-        "metadata.memory_type": memoryType,
-      };
-      if (date) filters["metadata.date"] = date;
-
       const existing = await this.callPod("search_documents", {
-        filters,
+        filters: { name: this.docName(userId, file) },
         fields: ["_id"],
         page_size: 1,
       });
