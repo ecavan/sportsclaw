@@ -52,27 +52,10 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def health(request: web.Request) -> web.Response:
-    """Service health check with installed skills count."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            SPORTSCLAW_BIN, SPORTSCLAW_ENTRY, "list",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_build_env(),
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        lines = [
-            l.strip() for l in stdout.decode().strip().splitlines()
-            if l.strip().startswith("- ")
-        ]
-        skills_count = len(lines)
-    except Exception:
-        skills_count = -1
-
+    """Lightweight liveness probe — no subprocess, instant response."""
     return web.json_response({
         "status": "ok",
         "service": "sportsclaw-relay",
-        "skills_installed": skills_count,
     })
 
 
