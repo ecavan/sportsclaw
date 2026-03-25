@@ -188,10 +188,10 @@ class FileMemoryStorage implements MemoryStorage {
 // PodMemoryStorage — Machina MCP pod documents
 // ---------------------------------------------------------------------------
 
-/** Map memory filenames to document metadata types */
-const FILE_TYPE_MAP: Record<string, string> = {
+/** Map memory filenames to field keys in the single consolidated document. */
+const FILE_FIELD_MAP: Record<string, string> = {
   SOUL: "soul",
-  FAN_PROFILE: "fan-profile",
+  FAN_PROFILE: "fan_profile",
   CONTEXT: "context",
   REFLECTIONS: "reflections",
   STRATEGY: "strategy",
@@ -199,35 +199,154 @@ const FILE_TYPE_MAP: Record<string, string> = {
   thread: "thread",
 };
 
-function parseMemoryFile(file: string): { memoryType: string; date?: string } {
+/** Old multi-doc type names (for migration lookups). */
+const OLD_DOC_TYPES = ["soul", "fan-profile", "context", "reflections", "strategy", "consolidated", "thread"];
+
+/**
+ * Map a memory filename to a field key in the consolidated document.
+ * Daily logs (YYYY-MM-DD.md) map to "today".
+ */
+function fileToField(file: string): { field: string; date?: string } {
   const name = file.replace(/\.(md|json)$/, "");
   const dateMatch = name.match(/^(\d{4}-\d{2}-\d{2})$/);
-  if (dateMatch) return { memoryType: "daily-log", date: dateMatch[1] };
-  return { memoryType: FILE_TYPE_MAP[name] ?? name.toLowerCase() };
+  if (dateMatch) return { field: "today", date: dateMatch[1] };
+  return { field: FILE_FIELD_MAP[name] ?? name.toLowerCase() };
 }
 
+/**
+ * Single-document pod storage. All memory fields for a user live in one
+ * document named `memory-{userId}` with fields as top-level value keys.
+ */
 export class PodMemoryStorage implements MemoryStorage {
+  // Per-turn in-memory cache: avoids repeated pod searches for the same doc.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private cache = new Map<string, { doc: Record<string, any>; docId: string | null; dirty: boolean }>();
+
   constructor(private mcpManager: McpManager, private serverName: string) {}
 
-  /** Deterministic document name for a user's memory file. */
-  private docName(userId: string, file: string): string {
-    const { memoryType, date } = parseMemoryFile(file);
-    return date
-      ? `memory-${userId}-daily-${date}`
-      : `memory-${userId}-${memoryType}`;
+  /**
+   * Load (or create) the single consolidated memory document for a user.
+   * Includes auto-migration from old multi-doc layout on first access.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async loadCached(userId: string): Promise<{ doc: Record<string, any>; docId: string | null; dirty: boolean }> {
+    const cached = this.cache.get(userId);
+    if (cached) return cached;
+
+    // Try to find existing consolidated doc
+    const result = await this.callPod("search_documents", {
+      filters: { name: `memory-${userId}` },
+      fields: ["_id", "value", "content"],
+      page_size: 1,
+    });
+
+    const raw = result?.data?.[0];
+    if (raw) {
+      const doc = raw?.value ?? raw?.content ?? {};
+      const entry = { doc, docId: raw._id ?? null, dirty: false };
+      this.cache.set(userId, entry);
+      return entry;
+    }
+
+    // No consolidated doc — attempt migration from old multi-doc layout
+    const migrated = await this.migrateOldDocs(userId);
+    const entry = { doc: migrated.doc, docId: migrated.docId, dirty: false };
+    this.cache.set(userId, entry);
+    return entry;
+  }
+
+  /**
+   * Migrate old individual memory-{userId}-{type} documents into a single
+   * memory-{userId} document. Deletes old docs after migration.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async migrateOldDocs(userId: string): Promise<{ doc: Record<string, any>; docId: string | null }> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const doc: Record<string, any> = {};
+    const oldDocIds: string[] = [];
+
+    // Map old doc type names to new field names
+    const typeToField: Record<string, string> = {
+      "soul": "soul",
+      "fan-profile": "fan_profile",
+      "context": "context",
+      "reflections": "reflections",
+      "strategy": "strategy",
+      "consolidated": "consolidated",
+      "thread": "thread",
+    };
+
+    // Search for each old doc type
+    for (const oldType of OLD_DOC_TYPES) {
+      try {
+        const oldName = `memory-${userId}-${oldType}`;
+        const res = await this.callPod("search_documents", {
+          filters: { name: oldName },
+          fields: ["_id", "value", "content", "text"],
+          page_size: 1,
+        });
+        const oldDoc = res?.data?.[0];
+        if (oldDoc) {
+          const text = oldDoc?.value?.text ?? oldDoc?.content?.text ?? oldDoc?.text ?? "";
+          if (text) {
+            doc[typeToField[oldType] ?? oldType] = text;
+          }
+          if (oldDoc._id) oldDocIds.push(oldDoc._id);
+        }
+      } catch {
+        // Skip failed lookups
+      }
+    }
+
+    // Check for today's daily log
+    try {
+      const today = todayStamp();
+      const dailyRes = await this.callPod("search_documents", {
+        filters: { name: `memory-${userId}-daily-${today}` },
+        fields: ["_id", "value", "content", "text"],
+        page_size: 1,
+      });
+      const dailyDoc = dailyRes?.data?.[0];
+      if (dailyDoc) {
+        const text = dailyDoc?.value?.text ?? dailyDoc?.content?.text ?? dailyDoc?.text ?? "";
+        if (text) {
+          doc.today = text;
+          doc.today_date = today;
+        }
+        if (dailyDoc._id) oldDocIds.push(dailyDoc._id);
+      }
+    } catch {
+      // Skip
+    }
+
+    // Create the consolidated document
+    const createResult = await this.callPod("create_document", {
+      name: `memory-${userId}`,
+      content: { value: doc },
+      metadata: { type: "user-memory", user_id: userId },
+    });
+    const docId = createResult?.data?._id ?? null;
+
+    // Fire-and-forget: delete old individual docs
+    for (const id of oldDocIds) {
+      this.callPod("delete_document", { item_id: id }).catch(() => {});
+    }
+
+    return { doc, docId };
   }
 
   async read(userId: string, file: string): Promise<string> {
     try {
-      const result = await this.callPod("search_documents", {
-        filters: { name: this.docName(userId, file) },
-        fields: ["_id", "content", "text"],
-        page_size: 1,
-      });
+      const { doc } = await this.loadCached(userId);
+      const { field, date } = fileToField(file);
 
-      // Handle both nested (new) and flat (old) document layouts
-      const doc = result?.data?.[0];
-      return doc?.value?.text ?? doc?.content?.text ?? doc?.text ?? "";
+      if (field === "today" && date) {
+        // If requesting a date that isn't today_date, return empty
+        if (doc.today_date && doc.today_date !== date) return "";
+        return doc.today ?? "";
+      }
+
+      return doc[field] ?? "";
     } catch {
       return "";
     }
@@ -235,34 +354,27 @@ export class PodMemoryStorage implements MemoryStorage {
 
   async write(userId: string, file: string, content: string): Promise<void> {
     try {
-      const { memoryType, date } = parseMemoryFile(file);
-      const name = this.docName(userId, file);
+      const entry = await this.loadCached(userId);
+      const { field, date } = fileToField(file);
 
-      const metadata: Record<string, unknown> = {
-        type: "user-memory",
-        user_id: userId,
-        memory_type: memoryType,
-      };
-      if (date) metadata.date = date;
-
-      // Upsert: search by deterministic name (not metadata) to avoid
-      // race-condition duplicates when concurrent processes write.
-      const existing = await this.callPod("search_documents", {
-        filters: { name },
-        fields: ["_id"],
-        page_size: 1,
-      });
-
-      if (existing?.data?.[0]) {
-        await this.callPod("update_document", {
-          item_id: existing.data[0]._id,
-          content: { value: { text: content } },
-        });
+      if (field === "today" && date) {
+        // Daily log rotation: if writing for a new day, move old today to consolidated
+        if (entry.doc.today_date && entry.doc.today_date !== date && entry.doc.today) {
+          const existing = entry.doc.consolidated ?? "";
+          entry.doc.consolidated = existing
+            ? `${existing}\n\n## ${entry.doc.today_date}\n${entry.doc.today}`
+            : `## ${entry.doc.today_date}\n${entry.doc.today}`;
+        }
+        entry.doc.today = content;
+        entry.doc.today_date = date;
       } else {
-        await this.callPod("create_document", { name, content: { value: { text: content } }, metadata });
+        entry.doc[field] = content;
       }
+
+      entry.dirty = true;
+      await this.flush(userId);
     } catch {
-      // Non-fatal: memory write failure shouldn't break the query
+      // Non-fatal
     }
   }
 
@@ -273,17 +385,11 @@ export class PodMemoryStorage implements MemoryStorage {
 
   async list(userId: string, _pattern: string): Promise<string[]> {
     try {
-      const result = await this.callPod("search_documents", {
-        filters: {
-          "metadata.type": "user-memory",
-          "metadata.user_id": userId,
-          "metadata.memory_type": "daily-log",
-        },
-        fields: ["metadata.date"],
-        sorters: [["metadata.date", 1]],
-      });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (result?.data ?? []).map((d: any) => `${d.metadata.date}.md`);
+      const { doc } = await this.loadCached(userId);
+      if (doc.today && doc.today_date) {
+        return [`${doc.today_date}.md`];
+      }
+      return [];
     } catch {
       return [];
     }
@@ -291,17 +397,51 @@ export class PodMemoryStorage implements MemoryStorage {
 
   async remove(userId: string, file: string): Promise<void> {
     try {
-      const existing = await this.callPod("search_documents", {
-        filters: { name: this.docName(userId, file) },
-        fields: ["_id"],
-        page_size: 1,
-      });
-      if (existing?.data?.[0]) {
-        await this.callPod("delete_document", { item_id: existing.data[0]._id });
+      const entry = await this.loadCached(userId);
+      const { field } = fileToField(file);
+
+      if (field === "today") {
+        entry.doc.today = "";
+        entry.doc.today_date = "";
+      } else {
+        entry.doc[field] = "";
       }
+
+      entry.dirty = true;
+      await this.flush(userId);
     } catch {
       // Non-fatal
     }
+  }
+
+  /** Write cached doc back to pod if dirty. */
+  async flush(userId: string): Promise<void> {
+    const entry = this.cache.get(userId);
+    if (!entry?.dirty) return;
+
+    try {
+      if (entry.docId) {
+        await this.callPod("update_document", {
+          item_id: entry.docId,
+          content: { value: entry.doc },
+        });
+      } else {
+        const result = await this.callPod("create_document", {
+          name: `memory-${userId}`,
+          content: { value: entry.doc },
+          metadata: { type: "user-memory", user_id: userId },
+        });
+        entry.docId = result?.data?._id ?? null;
+      }
+      entry.dirty = false;
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  /** Clear per-turn cache (call between turns if engine instance is reused). */
+  clearCache(): void {
+    this.cache.clear();
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
