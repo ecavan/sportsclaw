@@ -517,6 +517,17 @@ export class sportsclawEngine {
 
     const parts = [basePrompt];
 
+    // --- YOLO mode directive ---
+    if (this.config.yoloMode) {
+      parts.push("", `## Execution Mode: AUTONOMOUS (YOLO)
+
+You are running in fully autonomous mode with --yolo enabled.
+- Execute ALL tool calls immediately — no approval prompts, no clarification questions.
+- Optimize for throughput: parallel tool calls, minimal output tokens, data-first responses.
+- Do NOT use ask_user_question — decide autonomously based on available data.
+- write_file and execute_command run without gates. Use them freely.`);
+    }
+
     // --- Security directives (framework-level, trading gated by config) ---
     parts.push("", getSecurityDirectives(this.config.allowTrading));
 
@@ -1731,6 +1742,16 @@ export class sportsclawEngine {
           return "Error: options must contain 2-5 items.";
         }
 
+        // YOLO mode: auto-select first option, no halt
+        if (config.yoloMode) {
+          return JSON.stringify({
+            status: "auto_selected",
+            context_key,
+            selected: options[0],
+            reason: "YOLO mode — auto-selected first option to maintain execution velocity.",
+          });
+        }
+
         // Throw a sentinel error to halt the engine loop.
         // The listener catches this and renders native UI.
         throw new AskUserQuestionHalt({
@@ -2936,8 +2957,11 @@ export class sportsclawEngine {
 
     toolMap["write_file"] = defineTool({
       description:
-        "Write content to a file. This is a privileged " +
-        "operation that requires user approval. Content is written to the local filesystem.",
+        "Write content to a file. " +
+        (config.yoloMode
+          ? "Executes immediately in YOLO mode."
+          : "This is a privileged operation that requires user approval.") +
+        " Content is written to the local filesystem.",
       inputSchema: jsonSchema({
         type: "object",
         properties: {
@@ -2960,42 +2984,54 @@ export class sportsclawEngine {
           return "Error: both path and content are required.";
         }
 
+        // YOLO mode: execute immediately, no approval gate
+        if (config.yoloMode) {
+          const { writeFile, mkdir } = await import("node:fs/promises");
+          const { dirname } = await import("node:path");
+          await mkdir(dirname(filePath), { recursive: true });
+          await writeFile(filePath, fileContent, "utf-8");
+          return JSON.stringify({
+            status: "success",
+            action: "write_file",
+            path: filePath,
+            size: fileContent.length,
+          });
+        }
+
         // Check for allow-always rule
         const preApproved = await isActionPreApproved(
           agenticPlatform,
           agenticUserId,
           "write_file"
         );
-        if (!preApproved) {
-          const requestId = generateApprovalId();
-          throw new ApprovalPendingHalt({
-            id: requestId,
+        if (preApproved) {
+          const { writeFile, mkdir } = await import("node:fs/promises");
+          const { dirname } = await import("node:path");
+          await mkdir(dirname(filePath), { recursive: true });
+          await writeFile(filePath, fileContent, "utf-8");
+          return JSON.stringify({
+            status: "success",
             action: "write_file",
-            description: `Write ${fileContent.length} bytes to ${filePath}`,
-            toolArgs: { path: filePath, content: fileContent },
-            platform: agenticPlatform,
-            userId: agenticUserId,
-            createdAt: new Date().toISOString(),
+            path: filePath,
+            size: fileContent.length,
           });
         }
 
-        // Pre-approved: execute
-        return JSON.stringify({
-          status: "approval-pending",
-          message:
-            "write_file action was pre-approved via allow-always.",
-          action: "write_file",
-          path: filePath,
-          size: fileContent.length,
-        });
+        // Not approved and not YOLO: fail fast with error (no stdin blocking)
+        throw new Error(
+          `write_file denied: user approval required. Pass --yolo to bypass approval gates, ` +
+          `or pre-approve via /approve. Target: ${filePath} (${fileContent.length} bytes)`
+        );
       },
     });
 
     toolMap["execute_command"] = defineTool({
       description:
-        "Execute a shell command. This is a privileged " +
-        "operation that requires user approval. Use for " +
-        "running scripts, installing packages, or processing data.",
+        "Execute a shell command. " +
+        (config.yoloMode
+          ? "Executes immediately in YOLO mode."
+          : "This is a privileged operation that requires user approval.") +
+        " Use for running scripts, installing packages, or processing data.",
       inputSchema: jsonSchema({
         type: "object",
         properties: {
@@ -3020,34 +3056,57 @@ export class sportsclawEngine {
         }
         const effectiveTimeout = Math.min(timeoutMs ?? 30_000, 300_000);
 
+        // Helper: actually run the command via execFile
+        const runCommand = () =>
+          new Promise<string>((resolve) => {
+            const subprocessEnv = buildSubprocessEnv(config.env);
+            execFile(
+              "sh",
+              ["-c", cmd],
+              { timeout: effectiveTimeout, env: subprocessEnv, maxBuffer: 10 * 1024 * 1024 },
+              (error, stdout, stderr) => {
+                if (error) {
+                  resolve(JSON.stringify({
+                    status: "error",
+                    action: "execute_command",
+                    command: cmd,
+                    error: error.message,
+                    stderr: stderr?.slice(0, 2000) || "",
+                    stdout: stdout?.slice(0, 2000) || "",
+                  }));
+                } else {
+                  resolve(JSON.stringify({
+                    status: "success",
+                    action: "execute_command",
+                    command: cmd,
+                    stdout: stdout?.slice(0, 8000) || "",
+                    stderr: stderr?.slice(0, 2000) || "",
+                  }));
+                }
+              }
+            );
+          });
+
+        // YOLO mode: execute immediately, no approval gate
+        if (config.yoloMode) {
+          return runCommand();
+        }
+
         // Check for allow-always rule
         const preApproved = await isActionPreApproved(
           agenticPlatform,
           agenticUserId,
           "execute_command"
         );
-        if (!preApproved) {
-          const requestId = generateApprovalId();
-          throw new ApprovalPendingHalt({
-            id: requestId,
-            action: "execute_command",
-            description: `Execute: ${cmd.length > 120 ? cmd.slice(0, 120) + "..." : cmd}`,
-            toolArgs: { command: cmd, timeout_ms: effectiveTimeout },
-            platform: agenticPlatform,
-            userId: agenticUserId,
-            createdAt: new Date().toISOString(),
-          });
+        if (preApproved) {
+          return runCommand();
         }
 
-        // Pre-approved: execute
-        return JSON.stringify({
-          status: "approval-pending",
-          message:
-            "execute_command action was pre-approved via allow-always.",
-          action: "execute_command",
-          command: cmd,
-          timeout_ms: effectiveTimeout,
-        });
+        // Not approved and not YOLO: fail fast with error (no stdin blocking)
+        throw new Error(
+          `execute_command denied: user approval required. Pass --yolo to bypass approval gates, ` +
+          `or pre-approve via /approve. Command: ${cmd.length > 120 ? cmd.slice(0, 120) + "..." : cmd}`
+        );
       },
     });
 
@@ -3187,8 +3246,14 @@ export class sportsclawEngine {
       });
     }
 
+    // --- YOLO mode: log entry for observability ---
+    if (this.config.yoloMode && this.config.verbose) {
+      console.error("[sportsclaw] YOLO MODE — autonomous execution, zero interactive gates");
+    }
+
     // --- Sprint 2: Guide subagent — intercept meta-queries early ---
-    if (isGuideIntent(sanitizedPrompt)) {
+    // In YOLO mode, skip the guide intercept — the LLM handles everything.
+    if (!this.config.yoloMode && isGuideIntent(sanitizedPrompt)) {
       if (this.config.verbose) {
         console.error("[sportsclaw] guide intercept: handling meta-query");
       }
@@ -3274,6 +3339,23 @@ export class sportsclawEngine {
 
     this.messages.push({ role: "user", content: sanitizedPrompt });
 
+    // --- Context pruning: prevent memory bloat during continuous execution ---
+    // When the message history exceeds the configured threshold, drop older
+    // messages (keeping the most recent ones) to stay within context budget.
+    // Memory injections and thread history compound quickly in long-running
+    // sessions, so this is essential for autonomous / daemon modes.
+    const pruneThreshold = this.config.contextPruneThreshold;
+    if (pruneThreshold > 0 && this.messages.length > pruneThreshold) {
+      const keepCount = Math.floor(pruneThreshold * 0.6);
+      const dropped = this.messages.length - keepCount;
+      this.messages = this.messages.slice(-keepCount);
+      if (this.config.verbose) {
+        console.error(
+          `[sportsclaw] context pruned: dropped ${dropped} old messages, keeping ${this.messages.length}`
+        );
+      }
+    }
+
     let stepCount = 0;
     const emitProgress = options?.onProgress;
     const legacyUpdate = options?.onSpinnerUpdate;
@@ -3352,8 +3434,10 @@ export class sportsclawEngine {
     // --- Confidence-based clarification ---
     // Skip clarification on follow-up turns: the LLM already has conversation
     // history and can resolve ambiguity from prior context.
+    // YOLO mode: never pause to clarify — the loop must not stall.
     if (
       this.config.clarifyOnLowConfidence &&
+      !this.config.yoloMode &&
       !isFollowUp &&
       routing.decision &&
       routing.decision.confidence < this.config.clarifyThreshold &&
