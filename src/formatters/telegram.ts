@@ -2,13 +2,16 @@
  * sportsclaw — Telegram Renderer
  *
  * Converts a ParsedResponse into an HTML string for Telegram's HTML parse mode.
- * Headers → <b>, tables → <pre>, code → <pre>, bold → <b>, inline code → <code>.
+ * Headers → <b>, tables → inline text (no <pre> codeblocks), code → <pre>,
+ * bold → <b>, inline code → <code>.
+ *
+ * Tables are rendered as formatted text lines with mid-dot separators so they
+ * flow naturally in Telegram without the monospace codeblock treatment.
  */
 
 import {
   stripBold,
   isComparisonTable,
-  renderComparisonText,
 } from "./parser.js";
 import type { ParsedResponse, ParsedBlock } from "./parser.js";
 
@@ -26,12 +29,7 @@ export function renderTelegram(parsed: ParsedResponse): string {
         break;
 
       case "table": {
-        if (isComparisonTable(block.rows)) {
-          const text = renderComparisonText(block.rows, block.headerIndex);
-          result.push(`<pre>${escapeHtml(text)}</pre>`);
-        } else {
-          result.push(`<pre>${escapeHtml(renderAlignedTable(block))}</pre>`);
-        }
+        result.push(renderTableAsText(block));
         break;
       }
 
@@ -68,43 +66,86 @@ export function renderTelegram(parsed: ParsedResponse): string {
 }
 
 // ---------------------------------------------------------------------------
-// renderAlignedTable — fixed-width column alignment for monospace <pre>
+// renderTableAsText — render tables as flowing text, not <pre> codeblocks
 // ---------------------------------------------------------------------------
 
-function renderAlignedTable(block: ParsedBlock & { type: "table" }): string {
-  const stripped = block.rows.map((row) => row.map((c) => stripBold(c)));
+/**
+ * Render a table as formatted Telegram HTML text.
+ *
+ * - Comparison tables (3 columns): center-aligned key-value layout
+ * - Small tables (≤5 cols): each row as "Col1: Val1 · Col2: Val2" lines
+ * - Wide tables (>5 cols): each row joined with " · " separators
+ *
+ * No <pre> tags — everything flows as normal Telegram text.
+ */
+function renderTableAsText(block: ParsedBlock & { type: "table" }): string {
+  const rows = block.rows.map((row) => row.map((c) => stripBold(c)));
+  const headerIdx = block.headerIndex >= 0 ? block.headerIndex : 0;
+  const headerRow = rows[headerIdx];
+  const dataRows = rows.filter((_, i) => i !== headerIdx);
 
-  // Compute max width per column
-  const colCount = Math.max(...stripped.map((r) => r.length));
-  const colWidths: number[] = Array(colCount).fill(0);
-  for (const row of stripped) {
-    for (let c = 0; c < row.length; c++) {
-      colWidths[c] = Math.max(colWidths[c], row[c].length);
-    }
+  if (dataRows.length === 0) {
+    // Single-row table — just render it as a bold line
+    return `<b>${escapeHtml(headerRow.join(" · "))}</b>`;
+  }
+
+  // Comparison tables: centered key-value layout
+  if (isComparisonTable(rows)) {
+    return renderComparisonAsText(headerRow, dataRows);
   }
 
   const lines: string[] = [];
-  for (let r = 0; r < stripped.length; r++) {
-    const row = stripped[r];
-    const padded = row.map((cell, c) => {
-      // Right-align if the cell looks numeric, left-align otherwise
-      const w = colWidths[c];
-      return looksNumeric(cell) ? cell.padStart(w) : cell.padEnd(w);
-    });
-    lines.push(padded.join("  "));
 
-    // Add separator after header row
-    if (r === block.headerIndex) {
-      lines.push(colWidths.map((w) => "─".repeat(w)).join("──"));
+  // For tables with a clear first-column identifier (matchup, name, team),
+  // render each row as: bold first cell, then remaining values with headers
+  const hasIdentifier = headerRow.length >= 2;
+
+  for (const row of dataRows) {
+    if (hasIdentifier && headerRow.length <= 5) {
+      // "BOS @ MIA · 7:30 PM · BOS –4.5 · O/U 229.5" style
+      const parts: string[] = [];
+      for (let c = 0; c < row.length; c++) {
+        const val = row[c] || "";
+        if (c === 0) {
+          // First column bold (usually the matchup/name)
+          parts.push(`<b>${escapeHtml(val)}</b>`);
+        } else {
+          parts.push(escapeHtml(val));
+        }
+      }
+      lines.push(parts.join(" · "));
+    } else {
+      // Wide tables: just join with mid-dots
+      lines.push(escapeHtml(row.join(" · ")));
     }
   }
 
   return lines.join("\n");
 }
 
-/** Check if a string looks like a number, score, percentage, or stat. */
-function looksNumeric(s: string): boolean {
-  return /^\s*[-+]?\d[\d.,]*%?\s*$/.test(s) || /^\d+\s*-\s*\d+$/.test(s);
+// ---------------------------------------------------------------------------
+// renderComparisonAsText — 3-column comparison without <pre>
+// ---------------------------------------------------------------------------
+
+function renderComparisonAsText(
+  headerRow: string[],
+  dataRows: string[][],
+): string {
+  const team1 = headerRow[1] || "Home";
+  const team2 = headerRow[2] || "Away";
+
+  const lines: string[] = [];
+  lines.push(`<b>${escapeHtml(team1)}</b> vs <b>${escapeHtml(team2)}</b>`);
+  lines.push("");
+
+  for (const row of dataRows) {
+    const stat = row[0] || "";
+    const v1 = row[1] || "";
+    const v2 = row[2] || "";
+    lines.push(`${escapeHtml(v1)} · <i>${escapeHtml(stat)}</i> · ${escapeHtml(v2)}`);
+  }
+
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
