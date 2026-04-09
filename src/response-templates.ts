@@ -40,7 +40,7 @@ const TEMPLATES: Record<QueryIntent, ResponseTemplate> = {
   live_scores: {
     hint: "Lead with the current score and game status (quarter/period/half/inning). Include key performers. Keep it under 5 lines unless asked for more.",
     expectedToolPatterns: ["score", "live", "game"],
-    requiredKeywords: ["score", "Q1", "Q2", "Q3", "Q4", "period", "half", "inning", "final", "live"],
+    requiredKeywords: [],
   },
   standings: {
     hint: "Show standings as a ranked list: position, team, W-L record, and one key stat (GB, PCT, or points). Highlight the user's team if in Fan Profile.",

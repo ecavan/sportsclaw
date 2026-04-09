@@ -90,6 +90,7 @@ import { subagentManager, type SubagentResult } from "./subagent.js";
 import { heartbeatService } from "./heartbeat.js";
 import { buildTemplatePrompt, type QueryIntent } from "./response-templates.js";
 import { evaluateResponse } from "./evaluator.js";
+import { getSportDisplayName } from "./buttons.js";
 
 // ---------------------------------------------------------------------------
 // Package version (read once at import time)
@@ -3526,7 +3527,8 @@ export class sportsclawEngine {
       !isConversationalIntent(sanitizedPrompt)
     ) {
       const sport = routing.decision.selectedSkills[0];
-      const intentQ = `What would you like to know about ${sport}? For example:\n- Live scores or game updates\n- Standings\n- Today's schedule\n- Betting odds or best bets\n- Player or team stats\n- Recent news`;
+      const sportLabel = getSportDisplayName(sport);
+      const intentQ = `What would you like to know about ${sportLabel}? For example:\n- Live scores or game updates\n- Standings\n- Today's schedule\n- Betting odds or best bets\n- Player or team stats\n- Recent news`;
       this.messages.push({ role: "assistant", content: [{ type: "text", text: intentQ }] });
       if (memory) {
         await memory.appendToThread(sanitizedPrompt, intentQ);
