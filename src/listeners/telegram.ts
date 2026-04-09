@@ -376,9 +376,11 @@ export async function startTelegramListener(): Promise<void> {
   if (process.env.SPORTSCLAW_RESTART_CHAT_ID) {
     delete process.env.SPORTSCLAW_RESTART_CHAT_ID;
     // Send welcome + sport picker to all known users on reconnect
-    sendWelcomeToKnownUsers(apiBase).catch((e) =>
-      console.error("[sportsclaw] Welcome broadcast failed:", e)
-    );
+    if (process.env.SPORTSCLAW_BROADCAST_ON_STARTUP === "true") {
+      sendWelcomeToKnownUsers(apiBase).catch((e) =>
+        console.error("[sportsclaw] Welcome broadcast failed:", e)
+      );
+    }
   }
 
   // Mark boot time — ignore any messages sent before this to prevent
