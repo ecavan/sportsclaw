@@ -20,7 +20,7 @@ import { readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { sportsclawEngine } from "../engine.js";
-import type { LLMProvider, sportsclawConfig } from "../types.js";
+import type { sportsclawConfig } from "../types.js";
 import { splitMessage, saveImageToDisk, saveVideoToDisk } from "../utils.js";
 import { formatResponse, isGameRelatedResponse } from "../formatters/index.js";
 import {
@@ -35,6 +35,11 @@ import {
   loadSuspendedState,
   clearSuspendedState,
 } from "../ask.js";
+import {
+  getAllowedUsers,
+  ButtonContextStore,
+  buildListenerEngineConfig,
+} from "./shared.js";
 
 const COMMAND_PREFIX = "/claw";
 
@@ -82,49 +87,13 @@ interface InlineKeyboardButton {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Button context store — module-scoped instance shared across the listener.
 // ---------------------------------------------------------------------------
 
-/** Parse ALLOWED_USERS env var into a Set of user IDs, or null if unset */
-function getAllowedUsers(): Set<string> | null {
-  const raw = process.env.ALLOWED_USERS;
-  if (!raw) return null;
-  const ids = raw
-    .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean);
-  return ids.length > 0 ? new Set(ids) : null;
-}
-
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return parsed;
-}
-
-// ---------------------------------------------------------------------------
-// Button context store (ephemeral in-process map)
-// ---------------------------------------------------------------------------
-
-interface ButtonContext {
-  prompt: string;
-  userId: string;
-  sport: DetectedSport;
-}
-
-const buttonContexts = new Map<string, ButtonContext>();
-const MAX_BUTTON_CONTEXTS = 200;
+const buttonContexts = new ButtonContextStore();
 
 function storeButtonContext(prompt: string, userId: string, sport: DetectedSport): string {
-  const key = Math.random().toString(36).slice(2, 9);
-  buttonContexts.set(key, { prompt, userId, sport });
-  // Evict oldest entries beyond cap
-  if (buttonContexts.size > MAX_BUTTON_CONTEXTS) {
-    const firstKey = buttonContexts.keys().next().value;
-    if (firstKey) buttonContexts.delete(firstKey);
-  }
-  return key;
+  return buttonContexts.store(prompt, userId, sport);
 }
 
 // ---------------------------------------------------------------------------
@@ -337,26 +306,7 @@ export async function startTelegramListener(): Promise<void> {
     );
   }
 
-  const engineConfig: Partial<sportsclawConfig> = {
-    provider: (
-      process.env.SPORTSCLAW_PROVIDER ||
-      process.env.sportsclaw_PROVIDER ||
-      "anthropic"
-    ) as LLMProvider,
-    ...((process.env.SPORTSCLAW_MODEL || process.env.sportsclaw_MODEL) && {
-      model: process.env.SPORTSCLAW_MODEL || process.env.sportsclaw_MODEL,
-    }),
-    ...(process.env.PYTHON_PATH && { pythonPath: process.env.PYTHON_PATH }),
-    routingMode: "soft_lock",
-    routingMaxSkills: parsePositiveInt(
-      process.env.SPORTSCLAW_ROUTING_MAX_SKILLS,
-      2
-    ),
-    routingAllowSpillover: parsePositiveInt(
-      process.env.SPORTSCLAW_ROUTING_ALLOW_SPILLOVER,
-      1
-    ),
-  };
+  const engineConfig: Partial<sportsclawConfig> = buildListenerEngineConfig();
 
   // Verify the bot token is valid
   const meRes = await fetch(`${apiBase}/getMe`);

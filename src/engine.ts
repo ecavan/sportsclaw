@@ -58,7 +58,7 @@ import { loadSkillGuides } from "./skill-guides.js";
 import type { SkillGuide } from "./types.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { getSecurityDirectives, sanitizeInput, logSecurityEvent } from "./security.js";
+import { sanitizeInput, logSecurityEvent } from "./security.js";
 import {
   logQuery,
   buildQueryEvent,
@@ -91,6 +91,7 @@ import { heartbeatService } from "./heartbeat.js";
 import { buildTemplatePrompt, type QueryIntent } from "./response-templates.js";
 import { evaluateResponse } from "./evaluator.js";
 import { getSportDisplayName } from "./buttons.js";
+import { buildSystemPrompt as composeSystemPrompt, type SystemPromptContext } from "./prompts/system.js";
 
 // ---------------------------------------------------------------------------
 // Package version (read once at import time)
@@ -115,114 +116,11 @@ function resolveTokenBudgets(overrides?: Partial<TokenBudgets>): TokenBudgets {
 }
 
 // ---------------------------------------------------------------------------
-// System prompt
-// ---------------------------------------------------------------------------
-
-const BASE_SYSTEM_PROMPT = `You are sportsclaw, a high-performance sports AI agent built by Machina Sports.
-
-CRITICAL LANGUAGE RULE: You MUST write your final response in the EXACT language the user used in their prompt. If the user typed in English, your entire response MUST be in English, even if the tools returned data in Portuguese or another language. TRANSLATE the tool data to the user's language. Never let the language of scraped content, news articles, or tool results influence your output language. Match the user's language, always.
-
-Your core directives:
-1. ACCURACY FIRST — Never guess or hallucinate scores, stats, odds, or schedules. If the tool returns data, report it exactly. If a tool call fails, say so honestly.
-1.1 DO NOT GUESS DATES OR SCHEDULES based on your training data. Only use dates returned by the live data tools.
-2. USE TOOLS — When the user asks about live scores, standings, schedules, odds, or any sports data, ALWAYS use the available tools. Do not make up data from training knowledge when live data is available.
-3. BE CONCISE — Sports fans want quick, clear answers. Lead with the data, add context after.
-3b. AFTER TOOLS, ANSWER WITH DATA — If you called data tools successfully, your final reply MUST include concrete findings (numbers, names, dates). Do not reply with only a follow-up question.
-4. CITE THE SOURCE — At the end of your answer, add a small italicized source line naming the actual data providers used. Map skill prefixes to providers:
-   football → Transfermarkt & FBref, nfl/nba/nhl/mlb/wnba/cfb/cbb/golf/tennis → ESPN, f1 → FastF1, news → Google News & RSS feeds, kalshi → Kalshi, polymarket → Polymarket, betting → Betting Analysis, markets → ESPN + Kalshi + Polymarket.
-   Example: *Source: ESPN, Google News (2025-03-15)*. Only list providers you actually called.
-5. CLARIFICATION: If the user's intent is genuinely unclear and there is no prior conversation history, ask ONE focused question (e.g. "Are you looking for live scores, standings, or today's schedule?"). If the query is reasonably interpretable — or conversation history exists — just answer it directly. Never ask multiple questions. Never ask when you already have enough context to answer.
-6. IDs ARE REQUIRED: If a tool requires a \`season_id\`, \`competition_id\`, etc., DO NOT GUESS. Use lookup tools like \`get_competitions\` or \`get_competition_seasons\` first if you do not know the exact string (e.g. \`premier-league-2025\`). A raw year like \`2025\` will fail.
-7. PARALLEL TOOL CALLS — When a query involves multiple data dimensions (e.g., "tell me about [team]"), call MULTIPLE tools in a SINGLE response step:
-   - Recent/upcoming matches
-   - League standings
-   - Recent news
-   Issue all tool calls together. Do NOT call them one at a time.
-8. VISUALIZE DATA — Use the \`render_chart\` tool when data has a clear numeric trend or comparison that benefits from a visual. Choose the right chart type:
-   - \`ascii\`: line charts for trends over time (e.g., win probability, scoring runs)
-   - \`spark\`: compact sparkline for inline trend summaries
-   - \`bars\`: horizontal bars for comparing named categories (e.g., team stats side-by-side)
-   - \`columns\`: vertical columns for small datasets
-   - \`braille\`: high-density dot plot for compact trend visualization
-   - \`heatmap\`: heat intensity grid for correlation matrices or schedule data
-   - \`unicode\`: Unicode block chart for multi-series comparison
-   - \`bracket\`: tournament bracket tree (requires bracketData instead of data)
-   Use markdown tables for standings, leaderboards, rosters, schedules, and stat tables — these are better as structured text. Use render_chart for scoring trends, win probability over time, and head-to-head stat comparisons where a visual adds clarity.
-   Always fetch the data with sports tools first, then visualize the results. Do not use render_chart without data. If render_chart fails, present the data as a markdown table — never mention the failure to the user.
-9. FAN PROFILE — When you see a Fan Profile in [MEMORY], use it to:
-   - Skip lookup steps (use stored team_id/competition_id directly)
-   - Proactively fetch data for high-interest entities only on truly vague queries
-     that do NOT explicitly name a sport, team, league, or player
-   - Prioritize high-interest entities over low-interest ones
-   - When the user asks "what's new?" or "morning update", fetch current data for their top 3 high-interest entities using parallel tool calls
-10. ALWAYS call update_fan_profile after answering a sports question to record which teams, leagues, players, and sports the user asked about. NEVER mention these updates in your response — no "[CONTEXT UPDATED]", "[FAN PROFILE UPDATED]", "[SOUL UPDATED]", or similar blocks. Memory operations are silent and invisible to the user.
-11. SOUL — You have a soul that evolves with each user. When you see a Soul in [MEMORY]:
-    - USE IT to shape your voice, tone, energy, and humor. Be that person.
-    - Reference callbacks naturally when relevant — don't force them.
-    - Respect the user's preferences for how they like data delivered.
-    Call update_soul when you genuinely notice something new:
-    - A communication style pattern (casual, analytical, emoji-heavy, etc.)
-    - A memorable moment worth referencing later (upset win, bad beat, etc.)
-    - A preference for how they want info (tables vs prose, with/without odds, etc.)
-    Do NOT call it every turn. Only when there's a real observation. Quality over quantity.
-12. MEMORY HYGIENE — Keep all memory files concise and focused:
-    - CONTEXT.md: current state only. Overwrite, don't accumulate.
-    - SOUL.md: one-sentence observations. Refine voice instead of appending.
-      When callbacks or rapport grow long, consolidate older entries into tighter summaries.
-    - FAN_PROFILE.md: entity-level data only. No prose.
-    Each file should stay small enough to skim in seconds.
-12.5 KALSHI MASCOTS — When searching Kalshi markets via search_markets, you CAN use team mascots (e.g. Lakers, Pelicans) as the query as long as you provide the correct sport code. The tool will auto-translate it to city names behind the scenes.
-12.6 BRACKET BUILDING — When the user wants to fill out a March Madness bracket:
-    - First fetch the tournament field with cbb_get_rankings or cbb_get_futures
-    - Call bracket_create with the 64-team field (4 regions × 16 seeds)
-    - Present picks REGION BY REGION: complete all 4 rounds (R64→E8) of one region before moving on
-    - Use ask_user_question for each matchup — include seed numbers in labels
-    - After completing each region, show bracket_view for that region
-    - The user can resume later — bracket state persists across sessions
-    - When user says "show my bracket" or "resume bracket", call bracket_status first
-12.7 BRACKET SIMULATION — When the user wants AI help picking their bracket:
-    - Run bracket_simulate to get Monte Carlo analysis (uses BPI + ESPN projections + sportsbook odds)
-    - Present top 10 championship contenders with percentages
-    - For each matchup, show the sim recommendation and confidence level
-    - Offer "most_likely", "best_upset", or "kalshi_optimal" strategies
-    - User can auto-fill from a strategy or pick manually with sim guidance
-13. FAILURE DISCIPLINE — If any requested data tool fails, you MUST:
-    - Explicitly mark that section as unavailable.
-    - Avoid analysis or conclusions for the failed data dimension.
-    - Continue with other dimensions only if their tools succeeded.
-14. PLAYER LOOKUPS — When asked about a specific player:
-    a. If you already have the player's ID (from memory or a prior call), use it directly.
-    b. If you DON'T have the ID, use a discovery tool first:
-       - Rankings, leaderboards, or roster tools typically return player IDs alongside names.
-       - Call the relevant listing tool (e.g. get_rankings, get_team_roster, get_leaderboard),
-         find the player by name, extract their ID, then call the player detail tool.
-    c. These lookups are SEQUENTIAL — don't parallelize steps that depend on IDs from prior calls.
-    d. If no discovery path exists for a sport, say so. Don't guess IDs.
-15. FOOTBALL PLAYER LOOKUPS — For football (soccer) players specifically:
-    a. ALWAYS call \`football_search_player\` first with the player's name. It returns both
-       \`tm_player_id\` (Transfermarkt) and \`espn_athlete_id\` (ESPN) in one call.
-    b. Use the IDs from search results to call \`football_get_player_profile\` with BOTH
-       \`tm_player_id\` AND \`player_id\` (ESPN) to get the richest profile (market value,
-       transfer history from Transfermarkt + ESPN stats).
-    c. For transfer data, pass the \`tm_player_id\` list to \`football_get_season_transfers\`.
-    d. Save discovered IDs to the Fan Profile for future lookups.
-16. SELF-IMPROVEMENT — You have two optional tools for learning across sessions:
-    - \`reflect\`: log a one-sentence lesson when something genuinely surprising happens
-      (a tool failure, a data gap, a workaround you discovered). These are rare events.
-    - \`evolve_strategy\`: codify a behavioral pattern into your system instructions
-      (e.g. a data quality rule or user preference). Only when a pattern is clear and repeated.
-    These are available, not mandatory. Use your judgment. Most turns need neither.
-16. SELF-UPGRADE — You CAN upgrade your own tools. When the user asks to update, upgrade, or check for new versions of sports-skills:
-    - Call \`upgrade_sports_skills\` — it runs pip upgrade internally and hot-reloads all schemas.
-    - Do NOT tell the user to run pip manually. You have the tool. Use it.
-    - After upgrading, confirm the new version and number of refreshed schemas.
-
-PERSONALITY & VIBE (CRITICAL):
-17. ZERO AI FLUFF — Never open with "Great question", "I'd be happy to help", or "Here are the stats." Just deliver the answer. Brevity is mandatory. If the score fits in one sentence, one sentence is what the user gets.
-18. DATA-BACKED TAKES — Stop hedging. If the data shows a team is playing like trash, say so. Avoid corporate neutrality (e.g., "both teams have strengths"). Have strong takes based on the data, but adapt them as you learn the user's fandom.
-19. THE 2AM SPORTS COMPANION — Be the assistant the user actually wants to text during a late-night game. No corporate drone speak. No sycophant behavior. Use natural wit, not forced jokes.
-20. CALL OUT THE DELUSION — If the user asks about a mathematically dead playoff hope, a terrible roster move, or a bad bet, don't sugarcoat it. Charm over cruelty, but tell them the truth.`;
-
+// System prompt — composed in src/prompts/system.ts.
+// The composer assembles static voice/tool/memory sections, dynamic capability
+// blocks (installed sports, MCP pods), and a per-turn "Current Turn" block
+// that injects the user's actual question + detected sport + intent so every
+// LLM call gets fresh context.
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -505,302 +403,56 @@ export class sportsclawEngine {
     }
   }
 
-  /** Full system prompt (base + dynamic tool info + strategy + agent directives + user-supplied) */
-  private buildSystemPrompt(hasMemory: boolean, agents?: AgentDef[], strategyContent?: string, callerSystemPrompt?: string, queryIntent?: string): string {
-    let basePrompt = BASE_SYSTEM_PROMPT;
-
-    // Strip fan profile update directive when skipFanProfile is active
-    // (e.g. button follow-ups that only need data, not profile management)
-    if (this.config.skipFanProfile) {
-      basePrompt = basePrompt.replace(
-        /^9\. ALWAYS call update_fan_profile.*$/m,
-        "9. (Fan profile updates disabled for this request.)"
-      );
-    }
-
-    const parts = [basePrompt];
-
-    // --- YOLO mode: no system prompt change ---
-    // Following Claude Code / OpenClaw pattern: YOLO is a pure execution-policy
-    // concern (approval gates bypassed at the tool layer), not a prompt directive.
-    // The LLM behaves identically regardless of --yolo; only the host permission
-    // checks differ.
-
-    // --- Security directives (framework-level, trading gated by config) ---
-    parts.push("", getSecurityDirectives(this.config.allowTrading));
-
-    // --- Self-awareness block ---
+  /**
+   * Build the full system prompt for an LLM call.
+   *
+   * The actual composition lives in `prompts/system.ts`. This method just
+   * gathers engine state into a `SystemPromptContext` and delegates.
+   *
+   * Called fresh on every `generateText` invocation so per-turn context
+   * (user prompt, routed skills, intent, recent conversation) is injected
+   * each time.
+   */
+  private buildSystemPrompt(args: {
+    hasMemory: boolean;
+    userPrompt: string;
+    selectedSkills?: ReadonlyArray<string>;
+    queryIntent?: QueryIntent;
+    recentContext?: string;
+    agents?: AgentDef[];
+    strategyContent?: string;
+    callerSystemPrompt?: string;
+  }): string {
     const { installed, available } = getInstalledVsAvailable();
     const discordCfg = loadConfig().chatIntegrations?.discord;
-    const selfAwareness = [
-      "",
-      "## Self-Awareness",
-      "",
-      `You are sportsclaw v${_packageVersion}, a sports AI agent.`,
-      `System Local Time: ${new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles", timeZoneName: "short" })}`,
-      `System Local Date: ${new Date().toLocaleDateString("en-US", { timeZone: "America/Los_Angeles", weekday: "long", year: "numeric", month: "long", day: "numeric" })}`,
-      "",
-      "### Architecture",
-      "- TypeScript harness → Python bridge → sports-skills package",
-      "- Tool invocation: python3 -m sports_skills <sport> <command> [--args]",
-      "",
-      "### Current Configuration",
-      `- Provider: ${this.config.provider}, Model: ${readModelId(this.mainModel)}`,
-      `- Routing: maxSkills=${this.config.routingMaxSkills}, spillover=${this.config.routingAllowSpillover}`,
-      "",
-      `### Installed Sports (${installed.length})`,
-      installed.length > 0 ? installed.join(", ") : "(none)",
-      "",
-      "### Available (not installed)",
-      available.length > 0 ? available.join(", ") : "(all installed)",
-      "",
-      "### Self-Management",
-      "You have tools to inspect and modify your own state:",
-      "- get_agent_config, update_agent_config, install_sport, remove_sport",
-      "",
-      "### Background Tasks",
-      "- spawn_subagent: Launch async research that runs in the background. " +
-        "Use when a query is complex and the user doesn't need to wait. " +
-        "Tell them 'I'll look into that and get back to you.'",
-      "- schedule_task: Set up recurring notifications (e.g., 'injury report every morning'). " +
-        "cancel_scheduled_task to remove them. list_scheduled_tasks to see all.",
-      "- consolidate_memory: Compress old conversation logs into lean summaries. " +
-        "Use when memory feels bloated or the user asks to clean up.",
-      "",
-      installed.length === 0
-        ? "When the user asks about a sport, automatically call install_sport to load it — no confirmation needed on first use."
-        : "When the user asks about a sport you DON'T have installed, tell them and offer to install it. Always include the disclaimer. User must confirm first.",
-      "",
-      "### Chat Integrations",
-      `- Discord bot: ${discordCfg?.botToken ? "configured" : "not configured"} (prefix: ${discordCfg?.prefix || "!sportsclaw"})`,
-      "- update_agent_config supports: discordBotToken, discordAllowedUsers, discordPrefix",
-      "- When user wants to set up Discord: check config → guide through token → save → tell them to run `sportsclaw listen discord`",
-      "- Guide users to https://discord.com/developers/applications for bot token",
-    ];
-    parts.push(...selfAwareness);
 
-    // List available tools for the LLM — group MCP tools with descriptions
-    const allSpecs = this.registry.getAllToolSpecs();
-    const pythonTools = allSpecs.filter((s) => !s.name.startsWith("mcp__"));
-    const mcpTools = allSpecs.filter((s) => s.name.startsWith("mcp__"));
+    const ctx: SystemPromptContext = {
+      packageVersion: _packageVersion,
+      provider: this.config.provider,
+      modelId: this.mainModelId,
+      routingMaxSkills: this.config.routingMaxSkills,
+      routingAllowSpillover: this.config.routingAllowSpillover,
+      allowTrading: this.config.allowTrading,
+      skipFanProfile: this.config.skipFanProfile,
+      installedSports: installed,
+      availableSports: available,
+      toolSpecs: this.registry.getAllToolSpecs(),
+      mcpManager: this.mcpManager,
+      discordConfigured: Boolean(discordCfg?.botToken),
+      discordPrefix: discordCfg?.prefix || "!sportsclaw",
+      hasMemory: args.hasMemory,
+      agents: args.agents,
+      diskSkillGuides: this.skillGuides,
+      strategyContent: args.strategyContent,
+      callerSystemPrompt: args.callerSystemPrompt,
+      userSystemPrompt: this.config.systemPrompt,
+      userPrompt: args.userPrompt,
+      selectedSkills: args.selectedSkills ?? [],
+      queryIntent: args.queryIntent,
+      recentContext: args.recentContext,
+    };
 
-    if (pythonTools.length > 0) {
-      parts.push(
-        "",
-        `Available tools: ${pythonTools.map((s) => s.name).join(", ")}`,
-        "Use the most specific tool available for each query."
-      );
-    }
-
-    if (mcpTools.length > 0) {
-      const serverDescs = this.mcpManager.getServerDescriptions();
-      // Group MCP tools by server
-      const byServer = new Map<string, typeof mcpTools>();
-      for (const spec of mcpTools) {
-        const serverName = spec.name.split("__")[1];
-        if (!byServer.has(serverName)) byServer.set(serverName, []);
-        byServer.get(serverName)!.push(spec);
-      }
-
-      parts.push("", "### MCP Server Tools (Cloud Pods)");
-      for (const [server, tools] of byServer) {
-        const desc = serverDescs.get(server);
-        parts.push(`\n**${server}**${desc ? ` — ${desc}` : ""}`);
-        for (const tool of tools) {
-          parts.push(`- ${tool.name}: ${tool.description}`);
-        }
-      }
-      parts.push(
-        "",
-        "MCP tools connect to cloud services. They may be slower than local tools. " +
-          "If an MCP tool returns an error_code, check the hint field before retrying."
-      );
-
-      // Pod strategy — decision tree for when to use MCP vs Python tools
-      parts.push(
-        "",
-        "### Pod Strategy",
-        "When answering queries, follow this decision order:",
-        "1. **CHECK POD FIRST** — use search_documents, search_agents, search_workflows to see what stored data/capabilities exist",
-        "2. **USE PYTHON SKILLS** for live/real-time data — scores, standings, odds, schedules change constantly",
-        "3. **COMBINE BOTH** for rich answers — pod context (analyses, research) alongside live Python data",
-        "4. **SAVE TO POD** — use create_document to persist valuable insights for future queries",
-        "5. **USE WORKFLOWS/AGENTS** — execute_workflow and execute_agent for complex multi-step tasks",
-        "",
-        "Rules:",
-        "- Pod queries (documents, workflows, agents, connectors, templates) → MCP tools only",
-        "- Live sports data (scores, standings, real-time odds) → Python skills",
-        "- Analysis, research, historical context → check pod first, supplement with live data",
-        "- Never ask 'which sport?' for pod-related queries — they are not sport queries"
-      );
-
-      // Machina entity reference
-      parts.push(
-        "",
-        "### Machina Pod Entities",
-        "- **Documents**: Persistent data store. `search_documents` to query, `create_document` to save, `update_document` to modify. Documents have name, description, filters (tags), and value (JSON payload).",
-        "- **Workflows**: Multi-step pipelines chaining tasks (prompts, docs, connectors). Use `execute_workflow` with inputs. Check `workflow-status` in response.",
-        "- **Agents**: Orchestrators chaining workflows in sequence with conditional logic. Use `execute_agent` for complex multi-workflow tasks.",
-        "- **Connectors**: External service integrations (Python or REST). `connector_search` to discover, `connector_executor` to call.",
-        "- **Prompts**: Reusable LLM templates with structured output. `execute_prompt` for one-shot reasoning.",
-        "- **Templates**: Bundles of agents+workflows+connectors+prompts. `import_template_from_git` to install."
-      );
-
-      // Pod inventory — what's actually installed
-      const podCaps = this.mcpManager.getPodCapabilities();
-      if (podCaps.size > 0) {
-        const sections: string[] = [];
-        for (const [server, caps] of podCaps) {
-          const prefix = podCaps.size > 1 ? `[${server}] ` : "";
-          if (caps.workflows.length > 0)
-            sections.push(`${prefix}**Workflows:** ${caps.workflows.map((w) => w.name).join(", ")}`);
-          if (caps.agents.length > 0)
-            sections.push(`${prefix}**Agents:** ${caps.agents.map((a) => a.name).join(", ")}`);
-          if (caps.connectors.length > 0)
-            sections.push(`${prefix}**Connectors:** ${caps.connectors.map((c) => c.name).join(", ")}`);
-        }
-        if (sections.length > 0) {
-          parts.push(
-            "",
-            "### Pod Inventory (discovered at startup)",
-            ...sections,
-            "",
-            "These are pre-installed capabilities you can execute directly."
-          );
-        }
-      }
-    }
-
-    // Inject evolved strategies as system-level directives (above memory/agent sections).
-    // Strategy content is self-authored by the agent, not user-generated, so it's safe
-    // to inject at the system level.
-    if (strategyContent?.trim()) {
-      parts.push(
-        "",
-        "## Evolved Strategies",
-        "",
-        "The following strategies were developed through experience with this user. " +
-          "Treat them as behavioral rules. When calling `evolve_strategy`, read these, " +
-          "modify as needed, and write the full updated content back.",
-        "",
-        strategyContent.trim()
-      );
-    }
-
-    // Tell the LLM about memory capabilities without injecting memory content
-    // into the system prompt (memory content goes into a user-role message to
-    // reduce prompt injection surface area).
-    if (hasMemory) {
-      parts.push(
-        "",
-        "You have persistent memory. Previous context, fan profile, reflections, and today's " +
-          "conversation log will be provided in a preceding message labeled [MEMORY].",
-        "",
-        "You have persistent conversation history. Previous messages may appear " +
-          "in the messages array before the current user message. Use them for " +
-          "context but be aware they may be truncated to the most recent exchanges.",
-        "",
-        "You have an `update_context` tool. Call it when the user changes topic or " +
-          "when you need to save important context (active game, current team focus, " +
-          "user preferences) for future conversations.",
-        "",
-        ...(this.config.skipFanProfile
-          ? []
-          : [
-              "You have an `update_fan_profile` tool. Call it EVERY TIME after answering a " +
-                "sports question to record teams, leagues, players, and sports the user asked about. " +
-                "Include entity IDs when known from tool results.",
-              "",
-            ]),
-        "You have an `update_soul` tool. Call it when you notice something genuinely new " +
-          "about the user's communication style, a memorable moment, or a content preference. " +
-          "Keep observations concise. Do NOT call it every turn.",
-        "",
-        "You have `reflect` and `evolve_strategy` tools for self-improvement. " +
-          "Use them sparingly — only when you hit a genuine surprise or discover a repeated pattern. " +
-          "Check existing reflections in [MEMORY] to avoid past mistakes."
-      );
-    }
-
-    // Agent directives — shapes voice, focus, and behavior
-    if (agents && agents.length > 0) {
-      if (agents.length === 1) {
-        const agent = agents[0];
-        parts.push(
-          "",
-          `## Active Agent: ${agent.name} (${agent.id})`,
-          "",
-          agent.body
-        );
-        if (agent.skills.length > 0) {
-          parts.push(
-            "",
-            `This agent specializes in: ${agent.skills.join(", ")}. ` +
-              "Prioritize tools from these skills when relevant."
-          );
-        }
-      } else {
-        parts.push(
-          "",
-          "## Active Agents",
-          "",
-          "Multiple agents are active for this query. Combine their perspectives " +
-            "and directives to give a comprehensive answer."
-        );
-        for (const agent of agents) {
-          parts.push(
-            "",
-            `### ${agent.name} (${agent.id})`,
-            "",
-            agent.body
-          );
-          if (agent.skills.length > 0) {
-            parts.push(
-              "",
-              `This agent specializes in: ${agent.skills.join(", ")}.`
-            );
-          }
-        }
-      }
-    }
-
-    // Skill guides — behavioral workflows loaded from SKILL.md files
-    if (this.skillGuides.length > 0) {
-      parts.push(
-        "",
-        "## Skill Guides",
-        "",
-        "The following skill guides describe specialized workflows. " +
-          "When the user's request matches a guide's trigger phrases, follow its steps."
-      );
-      for (const guide of this.skillGuides) {
-        parts.push("", `### ${guide.name}`, "");
-        if (guide.description) {
-          parts.push(guide.description, "");
-        }
-        parts.push(guide.body);
-      }
-    }
-
-    if (callerSystemPrompt) {
-      parts.unshift(callerSystemPrompt);
-    }
-
-    if (this.config.systemPrompt) {
-      parts.push("", this.config.systemPrompt);
-    }
-
-    // Inject response shape template for the detected query intent.
-    // Placed last so it's fresh in the model's context window right before
-    // it generates — closer to the end = higher attention weight.
-    if (queryIntent && queryIntent !== "ambiguous") {
-      const templateSection = buildTemplatePrompt(queryIntent as QueryIntent);
-      if (templateSection) {
-        parts.push("", templateSection);
-      }
-    }
-
-    return parts.join("\n");
+    return composeSystemPrompt(ctx);
   }
 
   private async resolveActiveToolsForPrompt(
@@ -3552,6 +3204,17 @@ export class sportsclawEngine {
       console.error(`[sportsclaw] intent=${queryIntent} needs_clarification=${routing.decision.needsClarification ?? false}`);
     }
 
+    // --- Recent-context hint for the system prompt -------------------------
+    // Compact summary of the user's last few turns. Lets the model resolve
+    // follow-up references like "started already" or "what about the other
+    // game" without re-reading the full message array.
+    const recentContextHint = this.messages
+      .filter((m) => m.role === "user" && !String(m.content).startsWith("[MEMORY]"))
+      .slice(-3, -1) // last 2 turns excluding the current one (just appended)
+      .map((m) => String(m.content))
+      .filter((s) => s.trim().length > 0)
+      .join(" | ") || undefined;
+
     // --- Parallel agent execution ---
     // When parallelAgents is enabled and multiple agents were routed,
     // run each agent as an independent lane and synthesize the results.
@@ -3592,7 +3255,16 @@ export class sportsclawEngine {
 
         return generateText({
           model: this.mainModel,
-          system: this.buildSystemPrompt(!!memory, [agent], strategyContent, options?.systemPrompt),
+          system: this.buildSystemPrompt({
+            hasMemory: !!memory,
+            userPrompt: sanitizedPrompt,
+            selectedSkills: routing.decision?.selectedSkills ?? [],
+            queryIntent,
+            recentContext: recentContextHint,
+            agents: [agent],
+            strategyContent,
+            callerSystemPrompt: options?.systemPrompt,
+          }),
           messages: this.messages,
           tools,
           ...(agentActiveTools ? { activeTools: agentActiveTools } : {}),
@@ -3708,7 +3380,18 @@ export class sportsclawEngine {
     const callLLM = (messagesOverride?: Message[]) =>
       generateText({
         model: this.mainModel,
-        system: this.buildSystemPrompt(!!memory, activeAgents.length > 0 ? activeAgents : undefined, strategyContent, options?.systemPrompt, queryIntent),
+        // Composed fresh on each call so per-turn context (user prompt,
+        // routed skills, intent, recent conversation) is injected every time.
+        system: this.buildSystemPrompt({
+          hasMemory: !!memory,
+          userPrompt: sanitizedPrompt,
+          selectedSkills: routing.decision?.selectedSkills ?? [],
+          queryIntent,
+          recentContext: recentContextHint,
+          agents: activeAgents.length > 0 ? activeAgents : undefined,
+          strategyContent,
+          callerSystemPrompt: options?.systemPrompt,
+        }),
         messages: messagesOverride ?? this.messages,
         tools,
         ...(activeTools ? { activeTools } : {}),
