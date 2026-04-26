@@ -22,7 +22,6 @@
 
 import { spawn } from "node:child_process";
 import { sportsclawEngine } from "../engine.js";
-import type { LLMProvider } from "../types.js";
 import { splitMessage, saveImageToDisk, saveVideoToDisk } from "../utils.js";
 import { isGameRelatedResponse, formatTextForDiscord } from "../formatters/index.js";
 import {
@@ -39,6 +38,11 @@ import {
   loadSuspendedState,
   clearSuspendedState,
 } from "../ask.js";
+import {
+  getAllowedUsers,
+  ButtonContextStore,
+  buildListenerEngineConfig,
+} from "./shared.js";
 
 const PREFIX = process.env.DISCORD_PREFIX || "!sportsclaw";
 
@@ -66,28 +70,6 @@ function resolveFeatures(): Required<DiscordFeaturesConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Parse ALLOWED_USERS env var into a Set of user IDs, or null if unset */
-function getAllowedUsers(): Set<string> | null {
-  const raw = process.env.ALLOWED_USERS;
-  if (!raw) return null;
-  const ids = raw
-    .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean);
-  return ids.length > 0 ? new Set(ids) : null;
-}
-
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return parsed;
-}
-
-// ---------------------------------------------------------------------------
 // Poll detection
 // ---------------------------------------------------------------------------
 
@@ -112,27 +94,13 @@ function detectPollTeams(prompt: string): { team1: string; team2: string } | nul
 }
 
 // ---------------------------------------------------------------------------
-// Button context store (ephemeral in-process map)
+// Button context store — module-scoped instance shared across the listener.
 // ---------------------------------------------------------------------------
 
-interface ButtonContext {
-  prompt: string;
-  userId: string;
-  sport: DetectedSport;
-}
-
-const buttonContexts = new Map<string, ButtonContext>();
-const MAX_BUTTON_CONTEXTS = 200;
+const buttonContexts = new ButtonContextStore();
 
 function storeButtonContext(prompt: string, userId: string, sport: DetectedSport): string {
-  const key = Math.random().toString(36).slice(2, 9);
-  buttonContexts.set(key, { prompt, userId, sport });
-  // Evict oldest entries beyond cap
-  if (buttonContexts.size > MAX_BUTTON_CONTEXTS) {
-    const firstKey = buttonContexts.keys().next().value;
-    if (firstKey) buttonContexts.delete(firstKey);
-  }
-  return key;
+  return buttonContexts.store(prompt, userId, sport);
 }
 
 // ---------------------------------------------------------------------------
@@ -175,28 +143,7 @@ export async function startDiscordListener(): Promise<void> {
     `[sportsclaw] Discord features: embeds=${features.embeds}, buttons=${features.buttons}, polls=${features.polls}`
   );
 
-  const pythonPath = process.env.PYTHON_PATH || "python3";
-
-  const engineConfig = {
-    provider: (
-      process.env.SPORTSCLAW_PROVIDER ||
-      process.env.sportsclaw_PROVIDER ||
-      "anthropic"
-    ) as LLMProvider,
-    ...((process.env.SPORTSCLAW_MODEL || process.env.sportsclaw_MODEL) && {
-      model: process.env.SPORTSCLAW_MODEL || process.env.sportsclaw_MODEL,
-    }),
-    ...(process.env.PYTHON_PATH && { pythonPath: process.env.PYTHON_PATH }),
-    routingMode: "soft_lock" as const,
-    routingMaxSkills: parsePositiveInt(
-      process.env.SPORTSCLAW_ROUTING_MAX_SKILLS,
-      2
-    ),
-    routingAllowSpillover: parsePositiveInt(
-      process.env.SPORTSCLAW_ROUTING_ALLOW_SPILLOVER,
-      1
-    ),
-  };
+  const engineConfig = buildListenerEngineConfig();
 
   const client = new Client({
     intents: [
