@@ -108,6 +108,18 @@ function storeButtonContext(prompt: string, userId: string, sport: DetectedSport
 // ---------------------------------------------------------------------------
 
 export async function startDiscordListener(): Promise<void> {
+  // Process-level safety net — same rationale as the Telegram listener.
+  // discord.js handles its own gateway reconnects, but a Node-level unhandled
+  // rejection elsewhere can otherwise leave the process "alive" but degraded.
+  process.on("unhandledRejection", (reason) => {
+    console.error(`[sportsclaw] unhandledRejection: ${String(reason)}`);
+    process.exit(1);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error(`[sportsclaw] uncaughtException: ${err.stack ?? err.message}`);
+    process.exit(1);
+  });
+
   // Dynamic import — discord.js is an optional dependency
   let Discord: typeof import("discord.js");
   try {
