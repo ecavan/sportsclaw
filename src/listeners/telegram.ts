@@ -322,7 +322,45 @@ async function sendWelcomeToKnownUsers(apiBase: string): Promise<void> {
 // Main listener
 // ---------------------------------------------------------------------------
 
+// Belt-and-suspenders fetch: AbortSignal.timeout alone has been observed to
+// hang indefinitely on macOS sleep/wake or wifi roam (the underlying socket
+// goes quiet, undici doesn't honor the abort). A manual setTimeout-based
+// timeout always rejects, even if the abort is lost.
+async function fetchWithHardTimeout(
+  url: string,
+  abortMs: number,
+  hardMs: number
+): Promise<Response> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      fetch(url, { signal: AbortSignal.timeout(abortMs) }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`hard timeout after ${hardMs}ms`)),
+          hardMs
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function startTelegramListener(): Promise<void> {
+  // Process-level safety net: any unhandled error exits non-zero so the
+  // OS-level supervisor (launchd / systemd / Task Scheduler) can restart us.
+  // Without this, an unhandled rejection can leave the daemon "alive" but
+  // with the polling loop dead — the exact zombie state we keep hitting.
+  process.on("unhandledRejection", (reason) => {
+    console.error(`[sportsclaw] unhandledRejection: ${String(reason)}`);
+    process.exit(1);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error(`[sportsclaw] uncaughtException: ${err.stack ?? err.message}`);
+    process.exit(1);
+  });
+
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
     console.error("Error: TELEGRAM_BOT_TOKEN is required.");
@@ -385,16 +423,37 @@ export async function startTelegramListener(): Promise<void> {
     // Non-critical — worst case the date guard catches stale messages
   }
 
+  // Watchdog: if no successful poll completes for WATCHDOG_MS, exit so the
+  // OS supervisor restarts us. Defends against the rare case where the loop's
+  // catch block also hangs (e.g., console.error blocked on a broken pipe).
+  const WATCHDOG_MS = 2 * 60_000;
+  let lastSuccessfulPoll = Date.now();
+  const watchdogInterval = setInterval(() => {
+    const stale = Date.now() - lastSuccessfulPoll;
+    if (stale > WATCHDOG_MS) {
+      console.error(
+        `[sportsclaw] watchdog: no successful poll in ${stale}ms, exiting for supervisor restart`
+      );
+      process.exit(1);
+    }
+  }, 30_000);
+  // Don't let the watchdog itself keep the process alive.
+  watchdogInterval.unref?.();
+
   // Long-polling loop
   while (true) {
     try {
-      const res = await fetch(
+      const res = await fetchWithHardTimeout(
         `${apiBase}/getUpdates?timeout=30&offset=${offset}&allowed_updates=${encodeURIComponent(JSON.stringify(["message", "callback_query", "inline_query"]))}`,
-        { signal: AbortSignal.timeout(60_000) }
+        60_000, // AbortSignal.timeout
+        75_000  // hard setTimeout fallback
       );
       const data = (await res.json()) as TelegramResponse;
 
-      if (!data.ok || !data.result) continue;
+      if (!data.ok || !data.result) {
+        lastSuccessfulPoll = Date.now();
+        continue;
+      }
 
       // Advance offset for all received updates immediately
       for (const update of data.result) {
@@ -417,6 +476,7 @@ export async function startTelegramListener(): Promise<void> {
         return processMessage(update, apiBase, engineConfig, allowedUsers, bootEpoch);
       });
       await Promise.allSettled(tasks);
+      lastSuccessfulPoll = Date.now();
     } catch (error: unknown) {
       // Network errors during polling — retry after a short delay
       const errMsg = error instanceof Error ? error.message : String(error);
