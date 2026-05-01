@@ -248,6 +248,48 @@ function readEnvFile(filePath: string, key: string): string | undefined {
   return parseEnvFile(filePath)[key];
 }
 
+/**
+ * Sync a token saved by a wizard back into `~/.sportsclaw/.env` when that file
+ * already contains the same key with a stale value. Without this, a stale `.env`
+ * silently shadows the wizard's update because `firstEnv()` wins over config.json.
+ *
+ * Returns:
+ *   "updated" — `.env` had a different value and was rewritten to match.
+ *   "matched" — `.env` already had this exact value (no change).
+ *   "absent"  — `.env` does not set this key (no conflict possible from .env).
+ */
+export type EnvSyncResult = "updated" | "matched" | "absent";
+
+export function syncTokenToEnvFile(
+  envKey: string,
+  newValue: string
+): EnvSyncResult {
+  const existing = parseEnvFile(ENV_PATH)[envKey];
+  if (existing === undefined) return "absent";
+  if (existing === newValue) return "matched";
+  writeEnvVar(ENV_PATH, envKey, newValue);
+  return "updated";
+}
+
+/**
+ * Check whether a different value for `envKey` is already set in the running
+ * shell's environment. If yes, that value will win at runtime (firstEnv wins
+ * over config.json) and the wizard's saved token will not take effect until
+ * the variable is unset.
+ *
+ * Note: this can return `true` after `applyConfigToEnv()` populates the
+ * variable from `.env`. Callers that have already run `syncTokenToEnvFile`
+ * for this key can safely treat that match as "we just updated .env, the
+ * shell will pick it up on next launch" rather than a real shell-level conflict.
+ */
+export function shellEnvConflict(
+  envKey: string,
+  newValue: string
+): boolean {
+  const v = process.env[envKey];
+  return Boolean(v && v !== newValue);
+}
+
 export function resolveConfig(): ResolvedConfig {
   const file = loadConfig();
 
@@ -649,14 +691,28 @@ export async function runChannelsFlow(): Promise<void> {
       process.exit(0);
     }
 
+    const newDiscordToken = (tokenInput as string).trim();
     discordConfig = {
-      botToken: (tokenInput as string).trim(),
+      botToken: newDiscordToken,
       ...(allowedUsers.length > 0 && { allowedUsers }),
       prefix: (prefixInput as string) || "!sportsclaw",
       // Preserve existing feature flags and channels
       ...(existingDiscord?.features && { features: existingDiscord.features }),
       ...(existingDiscord?.channels && { channels: existingDiscord.channels }),
     };
+
+    const discordSync = syncTokenToEnvFile("DISCORD_BOT_TOKEN", newDiscordToken);
+    if (discordSync === "updated") {
+      p.log.warn(
+        `Rewrote stale DISCORD_BOT_TOKEN in ~/.sportsclaw/.env to match the new token.`
+      );
+    }
+    if (shellEnvConflict("DISCORD_BOT_TOKEN", newDiscordToken)) {
+      p.log.warn(
+        `Your shell already exports a different DISCORD_BOT_TOKEN. It will\n` +
+        `  override this saved token until you run: ${pc.cyan("unset DISCORD_BOT_TOKEN")}`
+      );
+    }
   }
 
   // --- Telegram ---
@@ -675,8 +731,9 @@ export async function runChannelsFlow(): Promise<void> {
 
     p.log.info(
       `Get a token from ${pc.cyan("@BotFather")} on Telegram.\n` +
-      `  The token will be saved to ~/.sportsclaw/config.json.\n` +
-      `  You can also set TELEGRAM_BOT_TOKEN in env or ~/.sportsclaw/.env.`
+      `  Resolution order at runtime: shell env > ~/.sportsclaw/.env > ~/.sportsclaw/config.json.\n` +
+      `  This wizard saves to config.json and will rewrite a stale TELEGRAM_BOT_TOKEN\n` +
+      `  in ~/.sportsclaw/.env so the new token actually takes effect.`
     );
 
     const tokenInput = await p.password({
@@ -701,10 +758,24 @@ export async function runChannelsFlow(): Promise<void> {
     }
     const allowedUsers = parseCommaList(allowedUsersInput as string);
 
+    const newToken = (tokenInput as string).trim();
     telegramConfig = {
-      botToken: (tokenInput as string).trim(),
+      botToken: newToken,
       ...(allowedUsers.length > 0 && { allowedUsers }),
     };
+
+    const sync = syncTokenToEnvFile("TELEGRAM_BOT_TOKEN", newToken);
+    if (sync === "updated") {
+      p.log.warn(
+        `Rewrote stale TELEGRAM_BOT_TOKEN in ~/.sportsclaw/.env to match the new token.`
+      );
+    }
+    if (shellEnvConflict("TELEGRAM_BOT_TOKEN", newToken)) {
+      p.log.warn(
+        `Your shell already exports a different TELEGRAM_BOT_TOKEN. It will\n` +
+        `  override this saved token until you run: ${pc.cyan("unset TELEGRAM_BOT_TOKEN")}`
+      );
+    }
   }
 
   // --- Save ---
@@ -922,6 +993,19 @@ async function configureDiscordIntegration(savedConfig: CLIConfig): Promise<Disc
   });
   if (p.isCancel(prefixInput)) return null;
 
+  const sync = syncTokenToEnvFile("DISCORD_BOT_TOKEN", token);
+  if (sync === "updated") {
+    p.log.warn(
+      `Rewrote stale DISCORD_BOT_TOKEN in ~/.sportsclaw/.env to match the new token.`
+    );
+  }
+  if (shellEnvConflict("DISCORD_BOT_TOKEN", token)) {
+    p.log.warn(
+      `Your shell already exports a different DISCORD_BOT_TOKEN. It will\n` +
+      `  override this saved token until you run: ${pc.cyan("unset DISCORD_BOT_TOKEN")}`
+    );
+  }
+
   return {
     botToken: token,
     ...(allowedUsers.length > 0 && { allowedUsers }),
@@ -962,6 +1046,19 @@ async function configureTelegramIntegration(savedConfig: CLIConfig): Promise<Tel
   });
   if (p.isCancel(allowedInput)) return null;
   const allowedUsers = parseCommaList(allowedInput as string);
+
+  const sync = syncTokenToEnvFile("TELEGRAM_BOT_TOKEN", token);
+  if (sync === "updated") {
+    p.log.warn(
+      `Rewrote stale TELEGRAM_BOT_TOKEN in ~/.sportsclaw/.env to match the new token.`
+    );
+  }
+  if (shellEnvConflict("TELEGRAM_BOT_TOKEN", token)) {
+    p.log.warn(
+      `Your shell already exports a different TELEGRAM_BOT_TOKEN. It will\n` +
+      `  override this saved token until you run: ${pc.cyan("unset TELEGRAM_BOT_TOKEN")}`
+    );
+  }
 
   return {
     botToken: token,

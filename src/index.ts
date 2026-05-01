@@ -63,8 +63,10 @@ import {
   runChannelsFlow,
   runSportSelectionFlow,
   writeEnvVar,
+  parseEnvFile,
   ENV_PATH,
   ASCII_LOGO,
+  PROVIDER_ENV,
 } from "./config.js";
 import {
   buildSportsSkillsRepairCommand,
@@ -911,6 +913,19 @@ async function cmdDoctor(opts?: { fromChat?: boolean }): Promise<void> {
     console.log(pc.green("  ✓") + ` Schema dir: ${getSchemaDir()}`);
   }
 
+  // 9. Config drift across env, ~/.sportsclaw/.env, and config.json
+  const driftIssues = detectConfigDrift();
+  if (driftIssues.length === 0) {
+    console.log(pc.green("  ✓") + " Config sources consistent (env / .env / config.json)");
+  } else {
+    console.log(pc.yellow("  ⚠") + ` Config drift across env / .env / config.json:`);
+    for (const issue of driftIssues) {
+      console.log(`    ${issue}`);
+    }
+    console.log(`    Fix: ${pc.cyan("sportsclaw channels")} (rewrites .env to match config.json)`);
+    allGood = false;
+  }
+
   // Summary
   console.log("");
   if (allGood) {
@@ -918,6 +933,86 @@ async function cmdDoctor(opts?: { fromChat?: boolean }): Promise<void> {
   } else {
     console.log(pc.yellow("Some issues found — see suggestions above."));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Config drift detection — compares env / ~/.sportsclaw/.env / config.json
+// for known keys and reports which one wins at runtime.
+// ---------------------------------------------------------------------------
+
+function detectConfigDrift(): string[] {
+  const file = loadConfig();
+  const dotenv = parseEnvFile(ENV_PATH);
+  const issues: string[] = [];
+
+  // Saved values per key, derived from config.json
+  const savedFor = (key: string): string | undefined => {
+    switch (key) {
+      case "TELEGRAM_BOT_TOKEN":
+        return file.chatIntegrations?.telegram?.botToken;
+      case "DISCORD_BOT_TOKEN":
+        return file.chatIntegrations?.discord?.botToken;
+      case "ANTHROPIC_API_KEY":
+      case "OPENAI_API_KEY":
+      case "GOOGLE_GENERATIVE_AI_API_KEY":
+        // Only meaningful when this is the active provider's env var
+        return file.provider && PROVIDER_ENV[file.provider] === key
+          ? file.apiKey
+          : undefined;
+      default:
+        return undefined;
+    }
+  };
+
+  const KEYS = [
+    "TELEGRAM_BOT_TOKEN",
+    "DISCORD_BOT_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+  ];
+
+  // process.env at this point already has .env loaded (cmdDoctor runs after
+  // applyConfigToEnv earlier in main()). To distinguish a real shell-level
+  // value from a value applyConfigToEnv copied in, compare against the .env
+  // file contents.
+  const looksFromShell = (key: string): boolean => {
+    const proc = process.env[key];
+    if (!proc) return false;
+    return proc !== dotenv[key];
+  };
+
+  for (const key of KEYS) {
+    const saved = savedFor(key);
+    const inDotenv = dotenv[key];
+    const inProc = process.env[key];
+
+    // Nothing configured anywhere → not interesting
+    if (!saved && !inDotenv && !inProc) continue;
+
+    const distinct = new Set(
+      [saved, inDotenv, looksFromShell(key) ? inProc : undefined].filter(
+        (v): v is string => Boolean(v)
+      )
+    );
+    if (distinct.size <= 1) continue; // all matching values
+
+    const mask = (v: string | undefined) =>
+      v ? `${v.slice(0, 6)}...${v.slice(-4)}` : pc.dim("(unset)");
+
+    const winner = looksFromShell(key)
+      ? "shell env"
+      : inDotenv
+        ? "~/.sportsclaw/.env"
+        : "config.json";
+
+    issues.push(
+      `${pc.bold(key)}: env=${mask(looksFromShell(key) ? inProc : undefined)} ` +
+      `.env=${mask(inDotenv)} config.json=${mask(saved)} → ${pc.yellow(winner)} wins`
+    );
+  }
+
+  return issues;
 }
 
 // ---------------------------------------------------------------------------
