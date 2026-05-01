@@ -113,14 +113,73 @@ function driver(): Driver {
 }
 
 // ---------------------------------------------------------------------------
+// pm2 migration — auto-clean any pm2-registered sportsclaw-<platform> entry
+// before installing the OS-native supervisor. Two supervisors managing the
+// same listener = duplicate Telegram polls / Discord gateways. The pm2 entry
+// was originally created by an older sportsclaw, so deleting it is safe.
+//
+// Opt out by setting SPORTSCLAW_KEEP_PM2=1 in the environment.
+// ---------------------------------------------------------------------------
+
+interface Pm2Process {
+  name: string;
+  pid?: number;
+  pm2_env?: { status?: string };
+}
+
+function migratePm2IfPresent(platform: DaemonPlatform): void {
+  if (process.env.SPORTSCLAW_KEEP_PM2 === "1") return;
+
+  // Only proceed if pm2 is actually on PATH.
+  const which = spawnSync(osPlatform() === "win32" ? "where.exe" : "which", ["pm2"], {
+    encoding: "utf-8",
+  });
+  if (which.status !== 0) return;
+
+  const list = spawnSync("pm2", ["jlist"], { encoding: "utf-8" });
+  if (list.status !== 0 || !list.stdout) return;
+
+  let procs: Pm2Process[];
+  try {
+    procs = JSON.parse(list.stdout) as Pm2Process[];
+  } catch {
+    return;
+  }
+
+  const target = `sportsclaw-${platform}`;
+  const match = procs.find((p) => p.name === target);
+  if (!match) return;
+
+  const status = match.pm2_env?.status ?? "unknown";
+  const pidPart = match.pid ? ` (PID ${match.pid})` : "";
+  console.log(
+    `Migrating from pm2: removing ${target}${pidPart}, status: ${status}`
+  );
+  // delete includes stop, idempotent. Discard output unless it fails loudly.
+  const del = spawnSync("pm2", ["delete", target], { encoding: "utf-8" });
+  if (del.status !== 0) {
+    console.error(
+      `pm2 delete ${target} failed (exit ${del.status}). Continuing — but you may end up with two supervisors. ` +
+        `Run \`pm2 delete ${target}\` manually if so, or set SPORTSCLAW_KEEP_PM2=1 to skip this check.`
+    );
+    return;
+  }
+  console.log(`  pm2 entry removed. The OS supervisor will take over now.`);
+}
+
+// ---------------------------------------------------------------------------
 // Public API — same surface as before, dispatched per-OS
 // ---------------------------------------------------------------------------
 
 export function daemonStart(platform: DaemonPlatform): void {
+  migratePm2IfPresent(platform);
   driver().start(platform);
 }
 
 export function daemonStop(platform: DaemonPlatform): void {
+  // Migration is silent when no pm2 entry exists, so this only fires when
+  // the user has a leftover pm2 daemon — exactly when stopping it is helpful.
+  migratePm2IfPresent(platform);
   driver().stop(platform);
 }
 
@@ -133,6 +192,7 @@ export function daemonLogs(platform: DaemonPlatform, lines = 50): void {
 }
 
 export function daemonRestart(platform: DaemonPlatform): void {
+  migratePm2IfPresent(platform);
   driver().restart(platform);
 }
 
@@ -303,13 +363,19 @@ const launchdDriver: Driver = {
       return;
     }
     // kickstart -k restarts cleanly, surviving even a hung process.
-    const r = spawnSync(
-      "launchctl",
-      ["kickstart", "-k", `gui/${process.getuid?.() ?? ""}/${launchdLabel(p)}`],
-      { stdio: "inherit" }
-    );
+    // process.getuid() is always defined on macOS (POSIX); the optional-call
+    // syntax exists only because Node types it as conditional for Windows.
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const r =
+      uid !== null
+        ? spawnSync(
+            "launchctl",
+            ["kickstart", "-k", `gui/${uid}/${launchdLabel(p)}`],
+            { stdio: "inherit" }
+          )
+        : { status: 1 };
     if (r.status !== 0) {
-      // Fall back to unload + load
+      // Fall back to unload + load (always works; just slower).
       spawnSync("launchctl", ["unload", plistPath], { stdio: "inherit" });
       spawnSync("launchctl", ["load", plistPath], { stdio: "inherit" });
     }
